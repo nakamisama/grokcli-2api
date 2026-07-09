@@ -1,0 +1,1369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>grokcli-2api 管理台</title>
+  <style>
+    :root {
+      --bg: #0b0d10;
+      --bg2: #12161c;
+      --bg3: #1a2029;
+      --border: #2a3340;
+      --text: #e8eef6;
+      --muted: #8b98a8;
+      --accent: #6ee7ff;
+      --accent2: #a78bfa;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --card: #141922;
+      --shadow: 0 10px 40px rgba(0,0,0,.35);
+      --radius: 14px;
+      --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh;
+      font-family: var(--font);
+      background:
+        radial-gradient(1200px 600px at 10% -10%, rgba(110,231,255,.12), transparent 50%),
+        radial-gradient(900px 500px at 100% 0%, rgba(167,139,250,.12), transparent 45%),
+        var(--bg);
+      color: var(--text);
+    }
+    a { color: var(--accent); text-decoration: none; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 20px 60px; }
+    header.app {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; margin-bottom: 28px; flex-wrap: wrap;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      width: 42px; height: 42px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      display: grid; place-items: center; font-weight: 800; color: #061018;
+      box-shadow: 0 0 24px rgba(110,231,255,.35);
+    }
+    .brand h1 { margin: 0; font-size: 1.25rem; letter-spacing: .2px; }
+    .brand p { margin: 2px 0 0; color: var(--muted); font-size: .85rem; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px; font-size: .75rem;
+      border: 1px solid var(--border); background: var(--bg2); color: var(--muted);
+    }
+    .pill.ok { border-color: rgba(52,211,153,.4); color: var(--ok); }
+    .pill.bad { border-color: rgba(248,113,113,.4); color: var(--bad); }
+    .pill.warn { border-color: rgba(251,191,36,.4); color: var(--warn); }
+
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,.03), transparent 40%), var(--card);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      box-shadow: var(--shadow); padding: 20px 22px; margin-bottom: 18px;
+    }
+    .card h2 {
+      margin: 0 0 14px; font-size: 1.05rem;
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .stat {
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 12px; padding: 14px 16px;
+    }
+    .stat .label { color: var(--muted); font-size: .78rem; margin-bottom: 6px; }
+    .stat .value { font-size: 1.15rem; font-weight: 650; word-break: break-all; }
+    .stat .sub { color: var(--muted); font-size: .78rem; margin-top: 4px; }
+
+    label { display: block; font-size: .82rem; color: var(--muted); margin-bottom: 6px; }
+    input, select, textarea {
+      width: 100%; padding: 10px 12px; border-radius: 10px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--text);
+      font: inherit; outline: none;
+    }
+    textarea { min-height: 110px; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .82rem; }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(110,231,255,.15); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+    .row > * { flex: 1; min-width: 140px; }
+    .btn {
+      appearance: none; border: 1px solid var(--border); background: var(--bg3);
+      color: var(--text); border-radius: 10px; padding: 10px 14px;
+      font: inherit; cursor: pointer; transition: .15s ease;
+      white-space: nowrap;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn.primary {
+      background: linear-gradient(135deg, rgba(110,231,255,.2), rgba(167,139,250,.2));
+      border-color: rgba(110,231,255,.45); color: #d9fbff; font-weight: 600;
+    }
+    .btn.primary:hover { filter: brightness(1.1); }
+    .btn.danger { border-color: rgba(248,113,113,.45); color: var(--bad); }
+    .btn.sm { padding: 6px 10px; font-size: .82rem; border-radius: 8px; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    th { color: var(--muted); font-weight: 550; font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
+    tr:hover td { background: rgba(255,255,255,.02); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
+    .muted { color: var(--muted); }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+    .auth-box { max-width: 420px; margin: 80px auto; }
+    .auth-box h1 { margin: 0 0 8px; font-size: 1.4rem; }
+    .auth-box p { color: var(--muted); margin: 0 0 18px; }
+    .toast {
+      position: fixed; right: 18px; bottom: 18px; z-index: 50;
+      background: var(--bg3); border: 1px solid var(--border); border-radius: 12px;
+      padding: 12px 16px; box-shadow: var(--shadow); max-width: 420px;
+      display: none; white-space: pre-wrap; word-break: break-word;
+    }
+    .toast.show { display: block; animation: in .2s ease; }
+    .toast.ok { border-color: rgba(52,211,153,.5); }
+    .toast.err { border-color: rgba(248,113,113,.5); }
+    @keyframes in { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .tab {
+      padding: 8px 14px; border-radius: 999px; border: 1px solid var(--border);
+      background: transparent; color: var(--muted); cursor: pointer; font: inherit;
+    }
+    .tab.active { color: var(--text); border-color: var(--accent); background: rgba(110,231,255,.08); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .codebox {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+      padding: 12px; font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: .82rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+    }
+    .reveal-key {
+      background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.35);
+      border-radius: 10px; padding: 12px; margin-top: 12px;
+    }
+    .device-box {
+      background: rgba(110,231,255,.06); border: 1px solid rgba(110,231,255,.3);
+      border-radius: 10px; padding: 14px; margin: 12px 0;
+    }
+    .device-box .code-big {
+      font-size: 1.6rem; font-weight: 700; letter-spacing: .12em;
+      font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--accent);
+      margin: 8px 0;
+    }
+    .hidden { display: none !important; }
+    .footer { margin-top: 28px; color: var(--muted); font-size: .8rem; text-align: center; }
+    .hint-box {
+      background: rgba(251,191,36,.06); border: 1px solid rgba(251,191,36,.25);
+      border-radius: 10px; padding: 10px 12px; font-size: .82rem; color: var(--muted); margin-bottom: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+
+  <div id="boot-view" class="wrap auth-box">
+    <div class="card">
+      <div class="brand" style="margin-bottom:16px">
+        <div class="logo">G</div>
+        <div>
+          <h1>grokcli-2api</h1>
+          <p id="boot-desc">正在连接本地服务…</p>
+        </div>
+      </div>
+      <p class="muted" id="boot-hint" style="margin:0;font-size:.85rem">
+        请用 <span class="mono">http://127.0.0.1:3000/admin</span> 访问（不要直接打开 HTML 文件）。
+      </p>
+    </div>
+  </div>
+
+  <div id="auth-view" class="wrap auth-box hidden">
+    <div class="card">
+      <div class="brand" style="margin-bottom:16px">
+        <div class="logo">G</div>
+        <div>
+          <h1 id="auth-title">登录管理台</h1>
+          <p id="auth-desc">使用管理员密码进入</p>
+        </div>
+      </div>
+      <label for="password">管理员密码</label>
+      <input id="password" type="password" placeholder="至少 4 位" autocomplete="current-password" />
+      <div class="row" style="margin-top:14px">
+        <button class="btn primary" id="auth-submit" style="flex:0 0 auto">进入</button>
+        <button class="btn" id="auth-refresh" style="flex:0 0 auto" title="刷新状态">刷新</button>
+      </div>
+      <p class="muted" style="margin:14px 0 0;font-size:.8rem">
+        也可设置环境变量 <span class="mono">GROK2API_ADMIN_PASSWORD</span>
+      </p>
+    </div>
+  </div>
+
+  <div id="main-view" class="wrap hidden">
+    <header class="app">
+      <div class="brand">
+        <div class="logo">G</div>
+        <div>
+          <h1>grokcli-2api</h1>
+          <p>OpenAI 兼容 · 多账号轮询 · Linux 可授权</p>
+        </div>
+      </div>
+      <div class="row" style="flex:0; gap:8px; align-items:center">
+        <span id="status-pill" class="pill">检查中…</span>
+        <button class="btn sm" id="btn-logout">退出</button>
+      </div>
+    </header>
+
+    <div class="card">
+      <h2>概览</h2>
+      <div class="grid" id="stats-grid"></div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="keys">API Keys</button>
+      <button class="tab" data-tab="accounts">账号 / 轮询</button>
+      <button class="tab" data-tab="models">模型</button>
+      <button class="tab" data-tab="guide">接入指南</button>
+    </div>
+
+    <div id="panel-keys" class="panel active">
+      <div class="card">
+        <h2>
+          <span>客户端 API Key</span>
+          <button class="btn sm primary" id="btn-create-key">新建 Key</button>
+        </h2>
+        <p class="muted" style="margin-top:-6px;margin-bottom:14px;font-size:.85rem">
+          列表可随时 <b>复制</b> 完整 Key（升级前创建的旧 Key 若无完整值需重建）。
+          调用 <span class="mono">/v1</span> 时带
+          <span class="mono">Authorization: Bearer sk-g2a-…</span>
+          或 <span class="mono">x-api-key</span>。
+        </p>
+        <div class="row" style="margin-bottom:12px">
+          <div>
+            <label>名称</label>
+            <input id="key-name" placeholder="例如 cherry-studio" />
+          </div>
+          <div>
+            <label>备注</label>
+            <input id="key-note" placeholder="可选" />
+          </div>
+        </div>
+        <div id="new-key-box" class="reveal-key hidden"></div>
+        <div style="overflow-x:auto;margin-top:8px">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th><th>前缀</th><th>状态</th><th>请求数</th><th>创建时间</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="keys-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-accounts" class="panel">
+      <div class="card">
+        <h2>
+          <span>轮询策略</span>
+        </h2>
+        <p class="muted" style="margin-top:-6px;margin-bottom:12px;font-size:.85rem">
+          多账号按策略分配请求（账号完全对等，无主账号）。上游 401/429/5xx 会冷却并自动切换；
+          <strong>额度耗尽</strong>会自动移出轮询，直到你手动重新启用。
+          同一对话会<strong>粘性绑定账号</strong>（不因轮询中途切号打断多轮记忆）；仅失败时才 failover。
+        </p>
+        <div class="row">
+          <div>
+            <label>账号模式</label>
+            <select id="account-mode">
+              <option value="round_robin">round_robin — 轮询（推荐）</option>
+              <option value="least_used">least_used — 最少使用优先</option>
+              <option value="random">random — 随机</option>
+            </select>
+          </div>
+          <div style="flex:0 0 auto">
+            <label>&nbsp;</label>
+            <button class="btn primary" id="btn-save-mode">保存策略</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>
+          <span>Grok 账号</span>
+          <div class="actions">
+            <button class="btn sm primary" id="btn-login-device">设备码登录</button>
+            <button class="btn sm" id="btn-refresh-quota">查询额度</button>
+            <button class="btn sm" id="btn-probe-all">全部模型探测</button>
+            <button class="btn sm" id="btn-refresh-acc">刷新</button>
+            <button class="btn sm danger" id="btn-logout-cli">注销全部</button>
+          </div>
+        </h2>
+        <div class="hint-box" id="linux-hint">
+          <strong>独立运行，无需本地 Grok CLI：</strong>
+          点「设备码登录」（原生 OIDC）→ 用手机/本机浏览器打开验证链接并输入设备码。
+          也可直接粘贴 JWT / auth.json 到下方「导入」，勾选合并实现<strong>多账号轮询</strong>。
+          凭证保存在项目 <span class="mono">data/auth.json</span>；额度查询走上游 <span class="mono">/v1/billing</span>，耗尽后自动关闭轮询。
+        </div>
+        <div id="quota-summary" class="muted" style="margin-bottom:12px;font-size:.85rem"></div>
+        <div id="model-health-info" class="muted" style="margin-bottom:12px;font-size:.82rem">模型探测：—</div>
+
+        <div id="device-session" class="device-box hidden">
+          <div class="muted" style="font-size:.82rem">设备码登录进行中（原生 OIDC）</div>
+          <div id="device-code" class="code-big">····</div>
+          <div class="muted">验证地址：<a id="device-url" href="#" target="_blank" rel="noopener">—</a></div>
+          <div class="muted" id="device-status" style="margin-top:8px;font-size:.82rem"></div>
+          <div class="actions" style="margin-top:10px">
+            <button class="btn sm" id="btn-poll-device">刷新登录状态</button>
+            <button class="btn sm" id="btn-copy-device">复制设备码</button>
+          </div>
+          <pre class="codebox" id="device-log" style="margin-top:10px;max-height:140px;overflow:auto"></pre>
+        </div>
+
+        <div class="card" style="background:var(--bg2);box-shadow:none;margin-bottom:14px;padding:14px 16px">
+          <h2 style="margin-bottom:8px;font-size:.95rem">
+            <span>Token 自动续期</span>
+            <span id="maintainer-pill" class="pill">—</span>
+          </h2>
+          <p class="muted" style="margin:0 0 10px;font-size:.82rem">
+            后台会按剩余时间自适应刷新 access token，并更新过期时间。也可手动强制刷新。
+          </p>
+          <div class="row" style="align-items:center">
+            <div class="muted" id="maintainer-info" style="flex:1;font-size:.82rem">—</div>
+            <div style="flex:0 0 auto;display:flex;gap:8px">
+              <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--text);font-size:.82rem;white-space:nowrap">
+                <input type="checkbox" id="chk-auto-refresh-ui" checked style="width:auto" /> 界面自动刷新过期时间
+              </label>
+              <button class="btn sm" id="btn-refresh-tokens">立即刷新 Token</button>
+              <button class="btn sm" id="btn-normalize-keys">规范化多账号键</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="accounts-empty" class="muted hidden" style="padding:8px 0">暂无账号，请设备码登录或导入 Token。</div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead>
+              <tr>
+                <th>邮箱</th><th>状态</th><th>池</th><th>本地请求</th><th>额度</th><th>模型探测</th><th>过期 / 剩余</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="accounts-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>
+          <span>账号 JSON 导入 / 导出</span>
+          <div class="actions">
+            <button class="btn sm" id="btn-export">导出 auth.json</button>
+          </div>
+        </h2>
+        <p class="muted" style="margin-top:-6px;margin-bottom:12px;font-size:.85rem">
+          通过<strong>选择 JSON 文件</strong>导入（完整 <span class="mono">auth.json</span>、本站导出文件、或单条账号 JSON）。
+          默认<strong>与现有账号合并</strong>；每个账号按 user_id 独立保存。
+          导出含完整 token，请妥善保管。
+        </p>
+        <label for="import-file">选择 JSON 文件</label>
+        <input type="file" id="import-file" accept=".json,application/json,text/json,.txt" style="padding:8px 0" />
+        <div id="import-file-name" class="muted" style="margin-top:6px;font-size:.82rem">未选择文件</div>
+        <div class="row" style="margin-top:12px;align-items:center">
+          <label style="display:flex;align-items:center;gap:8px;color:var(--text);margin:0">
+            <input type="checkbox" id="import-merge" checked style="width:auto" /> 与现有账号合并
+          </label>
+          <div style="flex:0 0 auto;display:flex;gap:8px">
+            <button class="btn primary" id="btn-import">导入文件</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-models" class="panel">
+      <div class="card">
+        <h2>
+          <span>可用模型</span>
+          <div class="actions">
+            <button class="btn sm" id="btn-sync-models">同步上游模型</button>
+          </div>
+        </h2>
+        <p class="muted" style="margin-top:-6px;margin-bottom:12px;font-size:.85rem">
+          模型列表来自 <span class="mono">models_cache.json</span>。连通性请在「账号」页对<strong>单个账号</strong>做模型探测；
+          后台会按间隔自动探测各账号是否报错（额度耗尽 / 模型不可用等会移出轮询）。
+        </p>
+        <div id="probe-result" class="codebox" style="margin-bottom:14px;min-height:48px;white-space:pre-wrap">在账号列表点「模型测试」查看结果</div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>名称</th><th>上下文</th><th>Reasoning</th></tr>
+            </thead>
+            <tbody id="models-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-guide" class="panel">
+      <div class="card">
+        <h2>客户端接入</h2>
+        <div class="grid" style="margin-bottom:14px">
+          <div class="stat">
+            <div class="label">Base URL</div>
+            <div class="value mono" id="guide-base">—</div>
+          </div>
+          <div class="stat">
+            <div class="label">默认模型</div>
+            <div class="value mono" id="guide-model">—</div>
+          </div>
+        </div>
+        <label>curl 示例 (OpenAI)</label>
+        <div class="codebox" id="guide-curl"></div>
+        <label style="margin-top:12px">Python (openai SDK)</label>
+        <div class="codebox" id="guide-py"></div>
+        <label style="margin-top:12px">curl / Python (Anthropic Messages)</label>
+        <div class="codebox" id="guide-anthropic"></div>
+        <label style="margin-top:12px">Linux 服务器快速部署</label>
+        <div class="codebox" id="guide-linux"></div>
+      </div>
+    </div>
+
+    <div class="footer">
+      grokcli-2api · 多账号轮询 · 仅供个人自用 · 请遵守 xAI 服务条款 ·
+      <a href="/docs" target="_blank">API Docs</a> ·
+      <a href="/health" target="_blank">Health</a>
+    </div>
+  </div>
+
+<script>
+const TOKEN_KEY = "g2a_admin_token";
+let token = localStorage.getItem(TOKEN_KEY) || "";
+let statusCache = null;
+let dashCache = null;
+let loginSessionId = null;
+let devicePollTimer = null;
+
+function $(id) { return document.getElementById(id); }
+function toast(msg, ok = true) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = "toast show " + (ok ? "ok" : "err");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove("show"), 4200);
+}
+function fmtTime(ts) {
+  if (!ts) return "—";
+  try { return new Date(ts * 1000).toLocaleString(); } catch { return String(ts); }
+}
+function fmtRemaining(ts) {
+  if (!ts) return "—";
+  const sec = Math.floor(Number(ts) - Date.now() / 1000);
+  if (Number.isNaN(sec)) return "—";
+  if (sec <= 0) return "已过期";
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 48) return `${Math.floor(h / 24)} 天 ${h % 24} 小时`;
+  if (h > 0) return `${h} 小时 ${m} 分`;
+  if (m > 0) return `${m} 分 ${s} 秒`;
+  return `${s} 秒`;
+}
+function remainingClass(ts) {
+  if (!ts) return "";
+  const sec = Number(ts) - Date.now() / 1000;
+  if (sec <= 0) return "bad";
+  if (sec < 15 * 60) return "warn";
+  return "ok";
+}
+function headers(json = true) {
+  const h = {};
+  if (json) h["Content-Type"] = "application/json";
+  if (token) h["X-Admin-Token"] = token;
+  return h;
+}
+async function api(path, opts = {}) {
+  const res = await fetch("/admin/api" + path, {
+    ...opts,
+    headers: { ...headers(!(opts.body instanceof FormData) && opts.method !== "GET"), ...(opts.headers || {}) },
+  });
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  if (!res.ok) {
+    const msg = (data && (data.detail || data.error || data.message)) || res.statusText;
+    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+function showBoot(msg, hint) {
+  $("boot-view").classList.remove("hidden");
+  $("auth-view").classList.add("hidden");
+  $("main-view").classList.add("hidden");
+  if (msg) $("boot-desc").textContent = msg;
+  if (hint) $("boot-hint").innerHTML = hint;
+}
+function showAuth(setup) {
+  $("boot-view").classList.add("hidden");
+  $("auth-view").classList.remove("hidden");
+  $("main-view").classList.add("hidden");
+  $("auth-title").textContent = setup ? "初始化管理密码" : "登录管理台";
+  $("auth-desc").textContent = setup
+    ? "首次使用，请设置管理员密码（至少 4 位）"
+    : "使用管理员密码进入";
+  $("auth-submit").textContent = setup ? "创建并进入" : "进入";
+}
+function showMain() {
+  $("boot-view").classList.add("hidden");
+  $("auth-view").classList.add("hidden");
+  $("main-view").classList.remove("hidden");
+  startAutoUiRefresh();
+}
+
+async function bootstrap() {
+  if (location.protocol === "file:") {
+    showBoot(
+      "请通过服务打开管理台",
+      '不要直接双击 HTML。请运行 <span class="mono">./start.sh</span> 或 <span class="mono">python app.py</span>，然后访问 <span class="mono">http://127.0.0.1:3000/admin</span>。'
+    );
+    toast("检测到 file:// 打开，无法连接 API", false);
+    return;
+  }
+
+  showBoot("正在连接服务…");
+  try {
+    statusCache = await api("/status");
+  } catch (e) {
+    const port = location.port || "3000";
+    showBoot(
+      "无法连接 grokcli-2api 服务",
+      `请先启动服务：<span class="mono">./start.sh</span> 或 <span class="mono">python app.py</span>，再打开 <span class="mono">http://127.0.0.1:${port}/admin</span>。<br><br>错误：${esc(e.message)}`
+    );
+    toast("无法连接服务: " + e.message, false);
+    return;
+  }
+  if (statusCache.setup_needed) {
+    token = "";
+    localStorage.removeItem(TOKEN_KEY);
+    showAuth(true);
+    return;
+  }
+  if (!token) {
+    showAuth(false);
+    return;
+  }
+  try {
+    await loadDashboard();
+    showMain();
+  } catch (e) {
+    if (e.status === 401) {
+      token = "";
+      localStorage.removeItem(TOKEN_KEY);
+      showAuth(false);
+      toast("会话已失效，请重新登录", false);
+    } else {
+      toast(e.message, false);
+      showAuth(false);
+    }
+  }
+}
+
+async function loadDashboard() {
+  dashCache = await api("/dashboard");
+  renderStats();
+  renderKeys();
+  renderAccounts();
+  renderModels();
+  renderModelHealthInfo();
+  renderGuide();
+  renderMaintainer();
+  const mode = dashCache.account_mode || "round_robin";
+  if ($("account-mode")) $("account-mode").value = mode;
+}
+
+function renderStats() {
+  const s = statusCache || {};
+  const d = dashCache || {};
+  const pool = d.pool || s.pool || {};
+  const credOk = !(d.credentials && d.credentials.error) && (s.credentials_ok || (pool.live > 0));
+  const pill = $("status-pill");
+  if (credOk) {
+    pill.className = "pill ok";
+    pill.textContent = "● 已登录 " + (s.credentials_email || "") + " · " + (d.account_mode || s.account_mode || "");
+  } else {
+    pill.className = "pill bad";
+    pill.textContent = "● 未登录 / 凭证异常";
+  }
+  const keys = d.keys || s.keys || {};
+  const acc = d.accounts || s.accounts || {};
+  const tm = d.token_maintainer || s.token_maintainer || {};
+  const rem = tm.min_remaining_sec;
+  const remLabel = rem == null ? "—" : fmtRemaining(Date.now() / 1000 + rem);
+  $("stats-grid").innerHTML = `
+    <div class="stat"><div class="label">API Base</div><div class="value mono">${esc(d.api_base || s.api_base || "")}</div></div>
+    <div class="stat"><div class="label">CLI 版本</div><div class="value mono">${esc(d.cli_version || s.cli_version || "")}</div>
+      <div class="sub">上游 ${esc(d.upstream || s.upstream || "")}</div></div>
+    <div class="stat"><div class="label">账号池</div><div class="value">${pool.enabled ?? acc.active_count ?? 0} 启用 / ${pool.live ?? acc.active_count ?? 0} 有效</div>
+      <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0}</div></div>
+    <div class="stat"><div class="label">API Keys</div><div class="value">${keys.enabled ?? 0} 启用 / ${keys.total ?? 0}</div>
+      <div class="sub">请求累计 ${keys.total_requests ?? 0} · 鉴权 ${keys.auth_required ? "开启" : "关闭"}</div></div>
+    <div class="stat"><div class="label">Token 自动续期</div><div class="value">${tm.running ? "运行中" : (tm.enabled === false ? "已关闭" : "未运行")}</div>
+      <div class="sub">最短剩余 ${esc(remLabel)} · 周期 ${tm.next_wait_sec ?? tm.interval_sec ?? "—"}s</div></div>
+  `;
+}
+
+function renderMaintainer() {
+  const d = dashCache || {};
+  const s = statusCache || {};
+  const tm = d.token_maintainer || s.token_maintainer || {};
+  const pill = $("maintainer-pill");
+  const info = $("maintainer-info");
+  if (!pill || !info) return;
+  if (tm.running) {
+    pill.className = "pill ok";
+    pill.textContent = "● 自动续期运行中";
+  } else if (tm.enabled === false) {
+    pill.className = "pill warn";
+    pill.textContent = "● 已禁用 (GROK2API_TOKEN_MAINTAIN=0)";
+  } else {
+    pill.className = "pill bad";
+    pill.textContent = "● 未运行";
+  }
+  const last = tm.last || {};
+  const refreshed = (last.refresh && last.refresh.refreshed) ?? "—";
+  const rem = tm.min_remaining_sec;
+  info.textContent = [
+    `最短剩余: ${rem == null ? "—" : fmtRemaining(Date.now() / 1000 + rem)}`,
+    `下次检查约 ${tm.next_wait_sec ?? tm.interval_sec ?? "—"}s`,
+    `上次刷新 ${refreshed} 个`,
+    last.at ? `于 ${fmtTime(last.at)}` : null,
+  ].filter(Boolean).join(" · ");
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+/** Robust clipboard copy (Clipboard API + textarea fallback). */
+async function copyText(text) {
+  const t = String(text ?? "");
+  if (!t) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(t);
+      return true;
+    }
+  } catch (_) { /* fall through */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = t;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;left:-9999px;top:0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, t.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+let keysCache = {};
+
+function renderKeys() {
+  api("/keys").then(data => {
+    const tbody = $("keys-tbody");
+    const keys = data.keys || [];
+    keysCache = {};
+    keys.forEach(k => { keysCache[k.id] = k; });
+    if (!keys.length) {
+      tbody.innerHTML = `<tr><td colspan="6" class="muted">暂无 Key。创建后客户端访问 /v1 将需要鉴权。</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = keys.map(k => {
+      const canCopy = !!(k.secret || k.key);
+      return `
+      <tr>
+        <td>${esc(k.name)}<div class="muted" style="font-size:.75rem">${esc(k.note || "")}</div></td>
+        <td class="mono" title="${canCopy ? "点击复制完整 Key" : "缺少完整 Key，需重新生成"}">${esc(k.prefix)}…</td>
+        <td>${k.enabled ? '<span class="pill ok">启用</span>' : '<span class="pill bad">停用</span>'}</td>
+        <td>${k.request_count || 0}</td>
+        <td class="muted">${fmtTime(k.created_at)}</td>
+        <td class="actions">
+          <button class="btn sm primary" data-act="copy" data-id="${esc(k.id)}" title="${canCopy ? "复制完整 Key" : "重新生成并复制完整 Key"}">${canCopy ? "复制" : "重建复制"}</button>
+          <button class="btn sm" data-act="toggle" data-id="${esc(k.id)}" data-on="${k.enabled ? 0 : 1}">${k.enabled ? "停用" : "启用"}</button>
+          <button class="btn sm danger" data-act="del" data-id="${esc(k.id)}">删除</button>
+        </td>
+      </tr>`;
+    }).join("");
+  }).catch(e => toast(e.message, false));
+}
+
+function fmtQuotaCell(p, liveQuota) {
+  const q = liveQuota || p.last_quota || null;
+  if (!q) {
+    return `<span class="muted">未查询</span>
+      <div style="margin-top:4px"><button class="btn sm" data-act="quota-one" data-id="${esc(p.id || "")}">查询</button></div>`;
+  }
+  if (q.error && !q.summary) {
+    return `<span class="pill bad">查询失败</span><div class="muted" style="font-size:.72rem;margin-top:4px">${esc(q.error)}</div>`;
+  }
+  const exhausted = q.exhausted || p.disabled_for_quota;
+  const summary = (q.display && q.display.summary) || q.summary || "—";
+  const pill = exhausted
+    ? '<span class="pill bad">额度耗尽</span>'
+    : (q.unlimited_or_free ? '<span class="pill ok">免费/促销</span>' : '<span class="pill ok">有额度</span>');
+  const detail = exhausted && p.disabled_reason
+    ? `<div class="muted" style="font-size:.72rem;margin-top:4px">${esc(p.disabled_reason)}</div>`
+    : `<div class="muted" style="font-size:.72rem;margin-top:4px">${esc(summary)}</div>`;
+  return `${pill}${detail}`;
+}
+
+let quotaCache = {}; // account_id -> quota result
+
+function renderAccounts() {
+  api("/accounts").then(data => {
+    const pool = data.pool || {};
+    const poolMap = {};
+    (pool.accounts || []).forEach(a => { poolMap[a.id] = a; });
+    const list = data.accounts || [];
+    $("accounts-empty").classList.toggle("hidden", list.length > 0);
+    const tbody = $("accounts-tbody");
+    tbody.innerHTML = list.map(a => {
+      const p = poolMap[a.id] || { id: a.id };
+      const enabled = p.enabled !== false;
+      const cooling = p.in_cooldown;
+      const quotaOff = p.disabled_for_quota;
+      let poolLabel;
+      if (quotaOff) poolLabel = '<span class="pill bad">额度禁用</span>';
+      else if (!enabled) poolLabel = '<span class="pill bad">已禁用</span>';
+      else if (cooling) poolLabel = '<span class="pill warn">冷却中</span>';
+      else poolLabel = '<span class="pill ok">轮询中</span>';
+      const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
+      const refreshPill = a.has_refresh_token
+        ? '<span class="pill ok" title="可自动 refresh">可自动续期</span>'
+        : '<span class="pill warn">无 refresh</span>';
+      const liveQ = quotaCache[a.id];
+      const remCls = remainingClass(a.expires_at);
+      const remPill = remCls
+        ? `<span class="pill ${remCls}">剩余 ${esc(fmtRemaining(a.expires_at))}</span>`
+        : '<span class="muted">—</span>';
+      const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
+      return `
+      <tr>
+        <td>${esc(a.email || "—")}<div class="muted mono" style="font-size:.72rem">${esc(a.id)}</div></td>
+        <td>${a.expired ? '<span class="pill bad">已过期</span>' : '<span class="pill ok">有效</span>'}</td>
+        <td>${poolLabel}</td>
+        <td class="muted" style="font-size:.8rem">${usage}</td>
+        <td style="font-size:.82rem;min-width:140px">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
+        <td style="font-size:.78rem;min-width:160px">${probeCell}</td>
+        <td class="muted" style="font-size:.8rem">
+          ${fmtTime(a.expires_at)}
+          <div style="margin-top:4px">${remPill} ${refreshPill}</div>
+        </td>
+        <td class="actions">
+          <button class="btn sm" data-act="probe-one" data-id="${esc(a.id)}">模型测试</button>
+          <button class="btn sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
+          <button class="btn sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
+          <button class="btn sm danger" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
+        </td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="8" class="muted">无账号</td></tr>`;
+  }).catch(e => toast(e.message, false));
+}
+
+function fmtProbeCell(lastProbe, lastError, blockedIds) {
+  const lp = lastProbe || null;
+  if (!lp) {
+    const err = lastError ? `<div class="muted" title="${esc(lastError)}" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lastError).slice(0, 48))}</div>` : '<span class="muted">未探测</span>';
+    return err;
+  }
+  const ok = lp.available || lp.ok;
+  const pill = ok
+    ? '<span class="pill ok">正常</span>'
+    : '<span class="pill bad">报错</span>';
+  const model = lp.model ? `<span class="mono">${esc(lp.model)}</span>` : "";
+  const when = lp.probed_at ? fmtTime(lp.probed_at) : "";
+  const blocked = (blockedIds && blockedIds.length)
+    ? `<div class="muted">屏蔽: ${esc(blockedIds.join(", "))}</div>`
+    : "";
+  const err = (!ok && lp.error)
+    ? `<div class="muted" title="${esc(lp.error)}" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lp.error).slice(0, 60))}</div>`
+    : "";
+  return `${pill} ${model}<div class="muted">${when}</div>${err}${blocked}`;
+}
+
+async function refreshAllQuota(showToast = true) {
+  try {
+    const data = await api("/accounts/quota");
+    quotaCache = {};
+    (data.accounts || []).forEach(q => {
+      if (q.account_id) quotaCache[q.account_id] = q;
+    });
+    const qs = $("quota-summary");
+    if (qs) {
+      const parts = [
+        `已查询 ${data.ok_count ?? 0}/${data.count ?? 0}`,
+        data.exhausted_count ? `耗尽 ${data.exhausted_count}` : null,
+        data.auto_disabled_count ? `已自动移出轮询 ${data.auto_disabled_count}` : null,
+      ].filter(Boolean);
+      qs.textContent = "额度汇总：" + parts.join(" · ");
+    }
+    if (showToast) {
+      const msg = data.auto_disabled_count
+        ? `额度已刷新；${data.auto_disabled_count} 个账号因额度耗尽移出轮询`
+        : "额度已刷新";
+      toast(msg, !data.auto_disabled_count || data.auto_disabled_count === 0);
+    }
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
+function renderModels() {
+  const models = (dashCache && dashCache.models) || [];
+  const tbody = $("models-tbody");
+  if (!tbody) return;
+  tbody.innerHTML = models.map(m => `
+    <tr>
+      <td class="mono">${esc(m.id)}</td>
+      <td>${esc(m.name || "—")}</td>
+      <td class="muted">${m.context_window ? m.context_window.toLocaleString() : "—"}</td>
+      <td class="muted">${m.supports_reasoning_effort ? "是" : "—"}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="4" class="muted">无模型缓存，使用默认 grok-4.5</td></tr>`;
+}
+
+function renderModelHealthInfo() {
+  const el = $("model-health-info");
+  if (!el) return;
+  const mh = (dashCache && dashCache.model_health)
+    || (statusCache && statusCache.model_health)
+    || {};
+  if (!mh.enabled) {
+    el.textContent = "模型探测：已关闭（GROK2API_MODEL_HEALTH=0）";
+    return;
+  }
+  const last = mh.last;
+  const lastTxt = last
+    ? `上次 ${fmtTime(last.at || last.probed_at)} · 可用 ${last.available_count ?? "—"}/${last.count ?? "—"} · 自动处理 ${last.auto_action_count ?? 0}`
+    : "尚未跑过周期探测";
+  el.textContent = `模型探测：后台每 ${mh.interval_sec ?? "?"}s 检查 · 模型 ${(mh.probe_models || []).join(", ") || "—"} · ${lastTxt}`;
+}
+
+async function runAccountProbe(accountId, model) {
+  const box = $("probe-result");
+  if (box) box.textContent = `探测中… account=${accountId}` + (model ? ` model=${model}` : "");
+  try {
+    const body = {};
+    if (model) body.model = model;
+    const r = await api("/accounts/" + encodeURIComponent(accountId) + "/probe", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const res = r.result || r;
+    const lines = [
+      r.ok || res.available ? "✓ 探测成功" : "✗ 探测失败",
+      `账号: ${r.email || res.email || accountId}`,
+      `模型: ${res.model || "—"}`,
+      res.latency_ms != null ? `耗时: ${res.latency_ms} ms` : null,
+      res.status_code != null ? `HTTP: ${res.status_code}` : null,
+      res.error ? `错误: ${res.error}` : null,
+      res.auto_disabled ? "已自动屏蔽模型 / 移出轮询" : null,
+    ].filter(Boolean);
+    if (box) box.textContent = lines.join("\n");
+    toast(r.ok || res.available ? "账号模型探测成功" : (res.error || "探测失败"), !!(r.ok || res.available));
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) {
+    if (box) box.textContent = "✗ " + e.message;
+    toast(e.message, false);
+  }
+}
+
+async function runProbeAll() {
+  const box = $("probe-result");
+  if (box) box.textContent = "正在探测全部账号…";
+  try {
+    const r = await api("/accounts/probe-all", { method: "POST", body: "{}" });
+    const lines = [
+      `全部探测完成`,
+      `可用 ${r.available_count ?? 0}/${r.count ?? 0}`,
+      `不可用 ${r.unavailable_count ?? 0}`,
+      `自动处理 ${r.auto_action_count ?? 0}`,
+    ];
+    const bad = (r.results || []).filter(x => !x.available);
+    bad.slice(0, 8).forEach(x => {
+      lines.push(`- ${x.email || x.account_id}: ${(x.error || "error").slice(0, 120)}`);
+    });
+    if (box) box.textContent = lines.join("\n");
+    toast(`探测完成：${r.available_count ?? 0}/${r.count ?? 0} 可用`);
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) {
+    if (box) box.textContent = "✗ " + e.message;
+    toast(e.message, false);
+  }
+}
+
+let uiRefreshTimer = null;
+let lastAutoTokenRefreshAt = 0;
+
+function startAutoUiRefresh() {
+  if (uiRefreshTimer) return;
+  uiRefreshTimer = setInterval(async () => {
+    if (!$("main-view") || $("main-view").classList.contains("hidden")) return;
+    const chk = $("chk-auto-refresh-ui");
+    if (chk && !chk.checked) {
+      // still tick remaining labels if accounts table visible
+      renderAccounts();
+      return;
+    }
+    try {
+      statusCache = await api("/status");
+      // lightweight: only re-render accounts + maintainer from status/accounts
+      await loadDashboard();
+      const tm = (dashCache && dashCache.token_maintainer) || (statusCache && statusCache.token_maintainer) || {};
+      const rem = tm.min_remaining_sec;
+      // if any token expires within 5 minutes, force refresh once per 2 minutes
+      if (rem != null && rem < 300 && Date.now() - lastAutoTokenRefreshAt > 120000) {
+        lastAutoTokenRefreshAt = Date.now();
+        try {
+          await api("/accounts/refresh", {
+            method: "POST",
+            body: JSON.stringify({ force: true }),
+          });
+          toast("临近过期，已自动刷新 Token");
+          statusCache = await api("/status");
+          await loadDashboard();
+        } catch (_) { /* ignore */ }
+      }
+    } catch (_) { /* ignore transient */ }
+  }, 30000);
+}
+
+function renderGuide() {
+  const base = (dashCache && dashCache.api_base) || (statusCache && statusCache.api_base) || "http://127.0.0.1:3000/v1";
+  const origin = base.replace(/\/v1\/?$/, "") || "http://127.0.0.1:3000";
+  const model = (dashCache && dashCache.default_model) || (statusCache && statusCache.default_model) || "grok-4.5";
+  $("guide-base").textContent = base;
+  $("guide-model").textContent = model;
+  $("guide-curl").textContent = `curl ${base}/chat/completions \\
+  -H "Authorization: Bearer sk-g2a-YOUR_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","messages":[{"role":"user","content":"你好"}],"stream":false}'`;
+  $("guide-py").textContent = `from openai import OpenAI
+client = OpenAI(base_url="${base}", api_key="sk-g2a-YOUR_KEY")
+r = client.chat.completions.create(
+    model="${model}",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(r.choices[0].message.content)
+
+# Tools / Function Calling 示例
+tools = [{
+  "type": "function",
+  "function": {
+    "name": "get_weather",
+    "description": "Get weather",
+    "parameters": {
+      "type": "object",
+      "properties": {"city": {"type": "string"}},
+      "required": ["city"],
+    },
+  },
+}]
+r = client.chat.completions.create(
+    model="${model}",
+    messages=[{"role": "user", "content": "北京天气？"}],
+    tools=tools,
+    tool_choice="auto",
+)
+print(r.choices[0].message.tool_calls or r.choices[0].message.content)`;
+  if ($("guide-anthropic")) {
+    $("guide-anthropic").textContent = `# Anthropic Messages API
+# Base URL 填网关根地址（或带 /v1）；鉴权用 x-api-key
+curl ${origin}/v1/messages \\
+  -H "x-api-key: sk-g2a-YOUR_KEY" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
+
+# Python anthropic SDK
+from anthropic import Anthropic
+client = Anthropic(base_url="${origin}", api_key="sk-g2a-YOUR_KEY")
+msg = client.messages.create(
+    model="${model}",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(msg.content[0].text)
+
+# Claude Code / 其他工具：API Base = ${origin}  或  ${origin}/v1
+# 模型名可用 claude-* 别名，会自动映射到默认 Grok 模型`;
+  }
+  $("guide-linux").textContent = `# Linux 服务器部署
+pip install -r requirements.txt
+export GROK2API_HOST=0.0.0.0
+export GROK2API_PORT=3000
+export GROK2API_ADMIN_PASSWORD='your-strong-password'
+export GROK2API_OPEN_BROWSER=0
+export GROK2API_ACCOUNT_MODE=round_robin   # 多账号轮询
+# 授权：管理台 → 设备码登录（无需 grok CLI）
+# 多账号：多次设备码登录，或导入多个 auth.json（勾选合并）
+nohup python3 app.py > grok2api.log 2>&1 &
+# 或: sudo cp deploy/grok2api.service /etc/systemd/system/ && systemctl enable --now grok2api`;
+}
+
+// Events
+$("auth-submit").onclick = async () => {
+  const password = $("password").value;
+  if (!password) return toast("请输入密码", false);
+  try {
+    const setup = statusCache && statusCache.setup_needed;
+    const data = setup
+      ? await api("/setup", { method: "POST", body: JSON.stringify({ password }) })
+      : await api("/login", { method: "POST", body: JSON.stringify({ password }) });
+    token = data.token;
+    localStorage.setItem(TOKEN_KEY, token);
+    $("password").value = "";
+    statusCache = await api("/status");
+    await loadDashboard();
+    showMain();
+    toast(setup ? "初始化成功" : "登录成功");
+  } catch (e) {
+    toast(e.message, false);
+  }
+};
+$("password").addEventListener("keydown", e => { if (e.key === "Enter") $("auth-submit").click(); });
+$("auth-refresh").onclick = () => bootstrap();
+$("btn-logout").onclick = async () => {
+  try { await api("/logout", { method: "POST" }); } catch {}
+  token = "";
+  localStorage.removeItem(TOKEN_KEY);
+  showAuth(false);
+};
+$("btn-create-key").onclick = async () => {
+  try {
+    const name = $("key-name").value || "default";
+    const note = $("key-note").value || "";
+    const data = await api("/keys", { method: "POST", body: JSON.stringify({ name, note }) });
+    // admin API may return { key: { ..., key, secret } } or nested shapes
+    const rec = data.key || data;
+    const full = (rec && (rec.key || rec.secret)) || data.secret || "";
+    const box = $("new-key-box");
+    box.classList.remove("hidden");
+    box.innerHTML = `<div style="font-weight:600;margin-bottom:6px;color:var(--ok)">✓ Key 已创建 — 列表中可随时再复制</div>
+      <div class="mono" id="new-key-value" style="user-select:all;word-break:break-all;cursor:pointer" title="点击复制">${esc(full)}</div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn sm primary" id="copy-key">复制 Key</button>
+        <button class="btn sm" id="dismiss-key">收起</button>
+      </div>`;
+    const doCopy = async () => {
+      if (!full) { toast("Key 为空", false); return; }
+      const ok = await copyText(full);
+      toast(ok ? "已复制 API Key" : "复制失败，请手动选中复制", ok);
+    };
+    $("copy-key").onclick = doCopy;
+    $("new-key-value").onclick = doCopy;
+    $("dismiss-key").onclick = () => box.classList.add("hidden");
+    // auto-copy once on create for convenience
+    if (full) {
+      const ok = await copyText(full);
+      if (ok) toast("已创建并自动复制到剪贴板");
+    }
+    $("key-name").value = "";
+    $("key-note").value = "";
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+};
+
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+    tab.classList.add("active");
+    $("panel-" + tab.dataset.tab).classList.add("active");
+  };
+});
+
+$("keys-tbody").onclick = async (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  try {
+    if (btn.dataset.act === "copy") {
+      const k = keysCache[id] || {};
+      let full = k.secret || k.key || "";
+      let regenerated = false;
+      if (!full) {
+        if (!confirm("该 Key 未保存完整值，无法直接复制。是否重新生成一个新 Key？旧 Key 会立即失效。")) return;
+        const data = await api("/keys/" + id + "/regenerate", { method: "POST" });
+        const rec = data.key || data;
+        full = (rec && (rec.key || rec.secret)) || data.secret || "";
+        if (!full) {
+          toast("Key 已重建，但接口未返回完整值，请刷新后再试", false);
+          await loadDashboard();
+          return;
+        }
+        keysCache[id] = rec;
+        regenerated = true;
+      }
+      const ok = await copyText(full);
+      toast(ok ? (regenerated ? "已重建并复制 API Key" : "已复制 API Key") : "复制失败，请手动选中复制", ok);
+      if (regenerated) await loadDashboard();
+      return;
+    }
+    if (btn.dataset.act === "del") {
+      if (!confirm("确定删除此 Key？")) return;
+      await api("/keys/" + id, { method: "DELETE" });
+      toast("已删除");
+    } else if (btn.dataset.act === "toggle") {
+      await api("/keys/" + id, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: btn.dataset.on === "1" }),
+      });
+      toast("已更新");
+    }
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (err) { toast(err.message, false); }
+};
+
+$("accounts-tbody").onclick = async (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  try {
+    if (btn.dataset.act === "probe-one") {
+      await runAccountProbe(id);
+      return;
+    }
+    if (btn.dataset.act === "quota-one") {
+      const q = await api("/accounts/" + encodeURIComponent(id) + "/quota");
+      quotaCache[id] = q;
+      if (q.auto_disabled) toast("该账号额度已耗尽，已移出轮询", false);
+      else if (q.ok) toast((q.display && q.display.summary) || "额度已更新");
+      else toast(q.error || "额度查询失败", false);
+      statusCache = await api("/status");
+      await loadDashboard();
+      return;
+    } else if (btn.dataset.act === "toggle-acc") {
+      await api("/accounts/" + encodeURIComponent(id) + "/enabled", {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: btn.dataset.on === "1" }),
+      });
+      toast(btn.dataset.on === "1" ? "已启用（重新加入轮询）" : "已禁用");
+    } else if (btn.dataset.act === "rm-acc") {
+      if (!confirm("确定从 auth.json 移除此账号？")) return;
+      await api("/accounts/" + encodeURIComponent(id), { method: "DELETE" });
+      toast("已移除");
+    }
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (err) { toast(err.message, false); }
+};
+
+if ($("btn-refresh-quota")) {
+  $("btn-refresh-quota").onclick = () => refreshAllQuota(true);
+}
+if ($("btn-probe-all")) {
+  $("btn-probe-all").onclick = () => runProbeAll();
+}
+
+$("btn-save-mode").onclick = async () => {
+  try {
+    const mode = $("account-mode").value;
+    await api("/settings/account-mode", {
+      method: "PUT",
+      body: JSON.stringify({ mode }),
+    });
+    toast("轮询策略已保存: " + mode);
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+};
+
+function showDeviceSession(r) {
+  $("device-session").classList.remove("hidden");
+  loginSessionId = r.session_id || loginSessionId;
+  if (r.user_code) $("device-code").textContent = r.user_code;
+  if (r.verification_url) {
+    $("device-url").textContent = r.verification_url;
+    $("device-url").href = r.verification_url;
+  }
+  $("device-status").textContent = (r.status || "") + " · " + (r.message || r.error || "");
+  if (r.output_tail) $("device-log").textContent = r.output_tail;
+}
+
+async function pollDeviceSession() {
+  if (!loginSessionId) return;
+  try {
+    const s = await api("/accounts/login/sessions/" + loginSessionId);
+    showDeviceSession(s);
+    if (s.status === "success") {
+      toast("登录成功");
+      clearInterval(devicePollTimer);
+      devicePollTimer = null;
+      statusCache = await api("/status");
+      await loadDashboard();
+    } else if (s.status === "error") {
+      toast(s.error || "登录失败", false);
+      clearInterval(devicePollTimer);
+      devicePollTimer = null;
+    }
+  } catch (e) {
+    /* ignore transient */
+  }
+}
+
+$("btn-login-device").onclick = async () => {
+  try {
+    const r = await api("/accounts/login", {
+      method: "POST",
+      body: JSON.stringify({ mode: "device", capture: true }),
+    });
+    if (!r.ok) return toast(r.error || "启动失败", false);
+    showDeviceSession(r);
+    clearInterval(devicePollTimer);
+    devicePollTimer = setInterval(pollDeviceSession, 2500);
+    // poll a few times quickly for user_code
+    setTimeout(pollDeviceSession, 1000);
+    setTimeout(pollDeviceSession, 3000);
+    toast(r.user_code ? ("设备码: " + r.user_code) : (r.message || "已启动设备码登录"));
+  } catch (e) { toast(e.message, false); }
+};
+$("btn-poll-device").onclick = () => pollDeviceSession();
+$("btn-copy-device").onclick = async () => {
+  const code = $("device-code").textContent;
+  if (!code || code === "····") return toast("暂无设备码", false);
+  try {
+    await navigator.clipboard.writeText(code);
+    toast("已复制设备码");
+  } catch {
+    toast(code);
+  }
+};
+
+if ($("import-file")) {
+  $("import-file").onchange = () => {
+    const f = $("import-file").files && $("import-file").files[0];
+    const label = $("import-file-name");
+    if (label) {
+      label.textContent = f
+        ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）`
+        : "未选择文件";
+    }
+  };
+}
+
+$("btn-import").onclick = async () => {
+  const input = $("import-file");
+  const f = input && input.files && input.files[0];
+  if (!f) return toast("请先选择 JSON 文件", false);
+  try {
+    const fd = new FormData();
+    fd.append("file", f);
+    fd.append("merge", $("import-merge").checked ? "true" : "false");
+    const r = await api("/accounts/import-file", { method: "POST", body: fd });
+    toast(r.message || `已导入 ${r.imported?.length || 0} 个账号`);
+    if (input) input.value = "";
+    if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+};
+
+if ($("btn-export")) {
+  $("btn-export").onclick = async () => {
+    try {
+      const res = await fetch("/admin/api/accounts/export?download=1", {
+        headers: headers(false),
+      });
+      if (!res.ok) {
+        let msg = res.statusText;
+        try {
+          const d = await res.json();
+          msg = d.detail || d.error || msg;
+        } catch { /* ignore */ }
+        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") || "";
+      let filename = "grok2api-auth-export.json";
+      const m = /filename=\"?([^\";]+)\"?/.exec(cd);
+      if (m) filename = m[1];
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast("已导出 auth.json");
+    } catch (e) { toast(e.message, false); }
+  };
+}
+
+$("btn-refresh-acc").onclick = async () => {
+  try {
+    statusCache = await api("/status");
+    await loadDashboard();
+    if (loginSessionId) await pollDeviceSession();
+    toast("已刷新");
+  } catch (e) { toast(e.message, false); }
+};
+$("btn-logout-cli").onclick = async () => {
+  if (!confirm("注销全部 Grok 账号？（清除 data/auth.json）")) return;
+  try {
+    const r = await api("/accounts/logout", { method: "POST" });
+    toast(r.message || "完成", !!r.ok);
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+};
+
+$("btn-refresh-tokens").onclick = async () => {
+  try {
+    $("btn-refresh-tokens").disabled = true;
+    const r = await api("/accounts/refresh", {
+      method: "POST",
+      body: JSON.stringify({ force: true }),
+    });
+    const n = r.refreshed ?? (r.results || []).filter(x => x.ok && !x.skipped).length;
+    const lines = (r.results || [])
+      .filter(x => x.ok && !x.skipped)
+      .map(x => `${x.email || x.id}: 新过期 ${fmtTime(x.expires_at)} (剩余 ${fmtRemaining(x.expires_at)})`);
+    toast(`Token 已刷新：${n} 个账号` + (lines.length ? " · " + lines[0] : ""));
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+  finally { $("btn-refresh-tokens").disabled = false; }
+};
+$("btn-normalize-keys").onclick = async () => {
+  try {
+    const r = await api("/accounts/normalize", { method: "POST" });
+    toast(`多账号键规范化：变更 ${r.changed ?? 0}，共 ${r.total ?? 0} 个`);
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) { toast(e.message, false); }
+};
+
+if ($("btn-sync-models")) {
+  $("btn-sync-models").onclick = async () => {
+    try {
+      const r = await api("/models/sync", { method: "POST" });
+      toast(`已同步 ${r.count || 0} 个模型`);
+      statusCache = await api("/status");
+      await loadDashboard();
+    } catch (e) { toast(e.message, false); }
+  };
+}
+
+bootstrap();
+</script>
+</body>
+</html>

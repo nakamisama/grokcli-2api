@@ -1,0 +1,678 @@
+"""Admin API routes: setup, login, keys, accounts, pool, quota, models, status."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import Any
+
+from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field
+
+import account_pool
+import accounts
+import apikeys
+import conversation_affinity
+import model_health
+import quota
+import token_maintainer
+from auth import AuthError, load_credentials
+import config as _config
+from config import (
+    CLI_VERSION,
+    DEFAULT_MODEL,
+    REQUIRE_API_KEY,
+    UPSTREAM_BASE,
+)
+from models import load_models_from_cache, resolve_model, sync_models_from_upstream
+from settings_store import (
+    VALID_ACCOUNT_MODES,
+    create_session_token,
+    get_account_mode,
+    get_public_settings,
+    is_setup_needed,
+    revoke_session,
+    set_account_mode,
+    set_admin_password,
+    verify_admin_password,
+    verify_session_token,
+)
+
+router = APIRouter(prefix="/admin/api", tags=["admin"])
+
+
+# ── request bodies ──────────────────────────────────────────────────────────
+
+
+class SetupBody(BaseModel):
+    password: str = Field(min_length=4, max_length=128)
+
+
+class LoginBody(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+
+
+class CreateKeyBody(BaseModel):
+    name: str = Field(default="default", max_length=64)
+    note: str = Field(default="", max_length=256)
+
+
+class UpdateKeyBody(BaseModel):
+    name: str | None = Field(default=None, max_length=64)
+    note: str | None = Field(default=None, max_length=256)
+    enabled: bool | None = None
+
+
+class LoginModeBody(BaseModel):
+    """Device-code only (OAuth / local CLI login removed)."""
+
+    mode: str = Field(default="device", pattern="^(device|oauth)$")
+    capture: bool | None = None
+
+
+class AccountModeBody(BaseModel):
+    mode: str = Field(description="round_robin | random | least_used")
+
+
+class AccountEnabledBody(BaseModel):
+    enabled: bool = True
+
+
+class ImportAuthBody(BaseModel):
+    """Import token / auth.json content for Linux servers."""
+    payload: str | dict = Field(
+        description="JWT string, single entry JSON, or full auth.json map"
+    )
+    merge: bool = Field(default=True, description="Merge into existing auth.json")
+
+
+class RefreshBody(BaseModel):
+    force: bool = Field(
+        default=True,
+        description="True = refresh all tokens; False = only near-expiry",
+    )
+
+
+class AccountProbeBody(BaseModel):
+    """Per-account model connectivity probe."""
+
+    model: str | None = Field(
+        default=None, description="Model id; default DEFAULT_MODEL / PROBE_MODELS"
+    )
+    auto_disable: bool | None = Field(
+        default=None,
+        description="On hard error: block model / disable account (default config)",
+    )
+
+
+# ── auth helpers ────────────────────────────────────────────────────────────
+
+
+def _extract_session(request: Request, x_admin_token: str | None) -> str | None:
+    if x_admin_token:
+        return x_admin_token.strip()
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.cookies.get("g2a_admin")
+
+
+def require_admin(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> str:
+    token = _extract_session(request, x_admin_token)
+    if verify_session_token(token):
+        return token or ""
+    raise HTTPException(status_code=401, detail="Admin authentication required")
+
+
+# ── public (no session) ─────────────────────────────────────────────────────
+
+
+@router.get("/status")
+async def admin_status():
+    setup = is_setup_needed()
+    account = accounts.account_status()
+    key_stats = apikeys.stats()
+    pool = account_pool.pool_summary()
+    creds_ok = False
+    creds_email = None
+    try:
+        c = load_credentials()
+        creds_ok = True
+        creds_email = c.email
+    except AuthError:
+        pass
+
+    host = _config.HOST
+    port = _config.PORT
+    base_host = "127.0.0.1" if host in ("0.0.0.0", "::", "localhost") else host
+    return {
+        "ok": True,
+        "setup_needed": setup,
+        "version": "1.4.0",
+        "cli_version": CLI_VERSION,
+        "host": host,
+        "port": port,
+        "upstream": UPSTREAM_BASE,
+        "default_model": DEFAULT_MODEL,
+        "require_api_key_mode": REQUIRE_API_KEY,
+        "api_base": f"http://{base_host}:{port}/v1",
+        "credentials_ok": creds_ok,
+        "credentials_email": creds_email,
+        "account_mode": get_account_mode(),
+        "accounts": account,
+        "pool": {
+            "mode": pool["mode"],
+            "total": pool["total"],
+            "live": pool["live"],
+            "enabled": pool["enabled"],
+            "in_cooldown": pool["in_cooldown"],
+        },
+        "keys": key_stats,
+        "models_count": len(load_models_from_cache()),
+        "settings": get_public_settings(),
+        "token_maintainer": token_maintainer.status(),
+        "model_health": model_health.status(),
+        "conversation_affinity": conversation_affinity.status(),
+    }
+
+
+@router.post("/setup")
+async def admin_setup(body: SetupBody):
+    if not is_setup_needed():
+        raise HTTPException(status_code=400, detail="Already set up")
+    try:
+        set_admin_password(body.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    token = create_session_token()
+    return {"ok": True, "token": token, "message": "Admin password created"}
+
+
+@router.post("/login")
+async def admin_login(body: LoginBody):
+    if is_setup_needed():
+        raise HTTPException(status_code=400, detail="Setup required first")
+    if not verify_admin_password(body.password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    token = create_session_token()
+    return {"ok": True, "token": token}
+
+
+@router.post("/logout")
+async def admin_logout(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    token = _extract_session(request, x_admin_token)
+    revoke_session(token)
+    return {"ok": True}
+
+
+# ── protected ───────────────────────────────────────────────────────────────
+
+
+@router.get("/dashboard")
+async def dashboard(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    account = accounts.account_status()
+    key_stats = apikeys.stats()
+    pool = account_pool.pool_summary()
+    try:
+        c = load_credentials()
+        cred = {
+            "email": c.email,
+            "user_id": c.user_id,
+            "expires_at": c.expires_at,
+            "auth_key": c.auth_key,
+            "team_id": c.team_id,
+        }
+    except AuthError as e:
+        cred = {"error": str(e)}
+    host = _config.HOST
+    port = _config.PORT
+    base_host = "127.0.0.1" if host in ("0.0.0.0", "::", "localhost") else host
+    return {
+        "credentials": cred,
+        "accounts": account,
+        "pool": pool,
+        "keys": key_stats,
+        "account_mode": get_account_mode(),
+        "account_modes": list(VALID_ACCOUNT_MODES),
+        "models": load_models_from_cache(),
+        "settings": get_public_settings(),
+        "api_base": f"http://{base_host}:{port}/v1",
+        "cli_version": CLI_VERSION,
+        "upstream": UPSTREAM_BASE,
+        "default_model": DEFAULT_MODEL,
+        "token_maintainer": token_maintainer.status(),
+        "model_health": model_health.status(),
+        "conversation_affinity": conversation_affinity.status(),
+    }
+
+
+@router.get("/keys")
+async def list_keys(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return {"keys": apikeys.list_keys(), "stats": apikeys.stats()}
+
+
+@router.post("/keys")
+async def create_key(
+    body: CreateKeyBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    rec = apikeys.create_key(body.name, body.note)
+    return {"ok": True, "key": rec}
+
+
+@router.post("/keys/{key_id}/regenerate")
+async def regenerate_key(
+    key_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    rec = apikeys.regenerate_key(key_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"ok": True, "key": rec}
+
+
+@router.patch("/keys/{key_id}")
+async def update_key(
+    key_id: str,
+    body: UpdateKeyBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    rec = None
+    if body.enabled is not None:
+        rec = apikeys.set_enabled(key_id, body.enabled)
+        if not rec:
+            raise HTTPException(status_code=404, detail="Key not found")
+    if body.name is not None or body.note is not None:
+        rec = apikeys.update_key(key_id, name=body.name, note=body.note)
+        if not rec:
+            raise HTTPException(status_code=404, detail="Key not found")
+    if rec is None:
+        for k in apikeys.list_keys():
+            if k["id"] == key_id:
+                rec = k
+                break
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"ok": True, "key": rec}
+
+
+@router.delete("/keys/{key_id}")
+async def delete_key(
+    key_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    if not apikeys.delete_key(key_id):
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"ok": True}
+
+
+@router.get("/accounts")
+async def list_accounts_route(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    status = accounts.account_status()
+    status["pool"] = account_pool.pool_summary()
+    return status
+
+
+@router.post("/accounts/login")
+async def account_login(
+    body: LoginModeBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return accounts.start_login(body.mode, capture=body.capture)
+
+
+@router.get("/accounts/login/sessions")
+async def login_sessions(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return {"sessions": accounts.list_login_sessions()}
+
+
+@router.get("/accounts/login/sessions/{session_id}")
+async def login_session_status(
+    session_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    sess = accounts.get_login_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Login session not found")
+    return sess
+
+
+@router.post("/accounts/import")
+async def import_account(
+    body: ImportAuthBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Import JWT / auth.json JSON body (API / script). Prefer file upload for UI."""
+    require_admin(request, x_admin_token)
+    result = accounts.import_auth_payload(body.payload, merge=body.merge)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "import failed")
+    return result
+
+
+@router.post("/accounts/import-file")
+async def import_account_file(
+    request: Request,
+    file: UploadFile = File(..., description="auth.json or export JSON"),
+    merge: str = Form(default="true"),
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Import accounts from a JSON file upload (no paste / textarea)."""
+    require_admin(request, x_admin_token)
+    merge_flag = str(merge).strip().lower() not in ("0", "false", "no", "off")
+    try:
+        raw_bytes = await file.read()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"read file failed: {e}") from e
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="empty file")
+    if len(raw_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="file too large (max 8MB)")
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise HTTPException(
+            status_code=400, detail=f"file must be UTF-8 JSON: {e}"
+        ) from e
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty file content")
+    try:
+        payload: Any = json.loads(text)
+    except json.JSONDecodeError as e:
+        if text.startswith("eyJ") and "." in text and "\n" not in text:
+            payload = text
+        else:
+            raise HTTPException(status_code=400, detail=f"invalid JSON: {e}") from e
+    result = accounts.import_auth_payload(payload, merge=merge_flag)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400, detail=result.get("error") or "import failed"
+        )
+    result["filename"] = file.filename
+    return result
+
+
+@router.get("/accounts/export")
+async def export_accounts(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    download: int = 1,
+):
+    """
+    Export full auth.json (with tokens) for backup / migration.
+    download=1 → attachment; download=0 → JSON body.
+    """
+    require_admin(request, x_admin_token)
+    result = accounts.export_auth_payload(include_secrets=True)
+    # Prefer plain auth map for re-import compatibility; wrap with meta
+    payload = {
+        "exported_at": result.get("exported_at") or time.time(),
+        "source": "grokcli-2api",
+        "count": result.get("count", 0),
+        "auth": result.get("auth") or {},
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    if download:
+        ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        filename = f"grok2api-auth-export-{ts}.json"
+        return Response(
+            content=body.encode("utf-8"),
+            media_type="application/json; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+    return JSONResponse(content=payload)
+
+
+@router.post("/accounts/logout")
+async def account_logout(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return accounts.run_logout()
+
+
+@router.delete("/accounts/{account_id:path}")
+async def delete_account(
+    account_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    if not accounts.remove_account(account_id):
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {"ok": True}
+
+
+@router.patch("/accounts/{account_id:path}/enabled")
+async def set_account_enabled_route(
+    account_id: str,
+    body: AccountEnabledBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    found = any(a["id"] == account_id for a in accounts.list_accounts())
+    if not found:
+        raise HTTPException(status_code=404, detail="Account not found")
+    rec = account_pool.set_account_enabled(account_id, body.enabled)
+    return {"ok": True, "account": rec}
+
+
+@router.get("/accounts/quota")
+async def list_accounts_quota(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Query billing quota for all accounts (cli-chat-proxy /v1/billing)."""
+    require_admin(request, x_admin_token)
+    return await quota.fetch_all_quotas(include_expired=False)
+
+
+@router.post("/accounts/{account_id:path}/probe")
+async def account_probe(
+    account_id: str,
+    body: AccountProbeBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Probe a single account with one model (connectivity / error check)."""
+    require_admin(request, x_admin_token)
+    model = resolve_model(body.model) if body.model else None
+    try:
+        result = await asyncio.to_thread(
+            model_health.probe_single_account,
+            account_id,
+            model,
+            auto_disable=body.auto_disable,
+            source="manual",
+        )
+    except AuthError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:400]) from e
+    return result
+
+
+@router.post("/accounts/probe-all")
+async def accounts_probe_all(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Run model probe for every live account (same as background cycle)."""
+    require_admin(request, x_admin_token)
+    return await asyncio.to_thread(model_health.run_once, source="manual_all")
+
+
+@router.get("/model-health")
+async def model_health_status(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return model_health.status()
+
+
+@router.get("/accounts/{account_id:path}/quota")
+async def account_quota(
+    account_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Query billing quota for one account."""
+    require_admin(request, x_admin_token)
+    try:
+        from auth import load_credentials_by_id
+
+        creds = load_credentials_by_id(account_id)
+    except AuthError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    result = await quota.fetch_quota_for_creds_async(creds)
+    if not result.get("ok"):
+        # still return payload so UI can show the error
+        return result
+    return result
+
+
+@router.put("/settings/account-mode")
+async def set_mode(
+    body: AccountModeBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    try:
+        mode = set_account_mode(body.mode)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "account_mode": mode,
+        "modes": list(VALID_ACCOUNT_MODES),
+    }
+
+
+@router.post("/accounts/refresh")
+async def refresh_accounts(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    body: RefreshBody | None = None,
+):
+    """
+    Refresh access tokens via refresh_token and update expires_at.
+    force=true (default) refreshes all accounts with a refresh_token.
+    """
+    require_admin(request, x_admin_token)
+    force = True if body is None else bool(body.force)
+    result = accounts.do_refresh_all(force=force)
+    # also kick background maintainer
+    try:
+        token_maintainer.request_run_soon()
+    except Exception:
+        pass
+    result["maintainer"] = token_maintainer.status()
+    return result
+
+
+@router.get("/maintainer")
+async def maintainer_status(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Token auto-refresh worker status + current remaining lifetimes."""
+    require_admin(request, x_admin_token)
+    st = token_maintainer.status()
+    st["accounts"] = accounts.list_accounts()
+    return st
+
+
+@router.post("/maintainer/run")
+async def maintainer_run(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    body: RefreshBody | None = None,
+):
+    """Run one maintenance cycle immediately (normalize + refresh)."""
+    require_admin(request, x_admin_token)
+    force = True if body is None else bool(body.force)
+    result = token_maintainer.run_once(force=force)
+    return result
+
+
+@router.post("/accounts/normalize")
+async def normalize_accounts(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Re-key auth.json to per-user multi-account layout."""
+    require_admin(request, x_admin_token)
+    return accounts.do_normalize_keys()
+
+
+@router.get("/models")
+async def admin_models(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    return {
+        "object": "list",
+        "data": load_models_from_cache(),
+        "default_model": DEFAULT_MODEL,
+    }
+
+
+@router.post("/models/sync")
+async def models_sync(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Fetch model list from cli-chat-proxy and update models_cache.json."""
+    require_admin(request, x_admin_token)
+    result = sync_models_from_upstream()
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error") or "sync failed")
+    return result
+
+

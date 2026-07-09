@@ -1,0 +1,149 @@
+"""Configuration for grokcli-2api (standalone — no local Grok CLI required)."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# Local server
+HOST = os.getenv("GROK2API_HOST", "127.0.0.1")
+PORT = int(os.getenv("GROK2API_PORT", "3000"))
+# Legacy single key (still accepted if set). Prefer managed keys in data/keys.json
+API_KEY = os.getenv("GROK2API_API_KEY", "")
+
+# Admin console password (required for /admin APIs & web when set).
+# If empty, first-time setup can create one stored in data/settings.json
+ADMIN_PASSWORD = os.getenv("GROK2API_ADMIN_PASSWORD", "")
+
+# Upstream cli-chat-proxy (session-token compatible endpoint)
+UPSTREAM_BASE = os.getenv(
+    "GROK_CLI_CHAT_PROXY_BASE_URL",
+    "https://cli-chat-proxy.grok.com/v1",
+).rstrip("/")
+
+# App data — fully self-contained under project (or GROK2API_DATA_DIR)
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("GROK2API_DATA_DIR", APP_ROOT / "data"))
+KEYS_FILE = DATA_DIR / "keys.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+STATIC_DIR = APP_ROOT / "static"
+
+# Auth + model cache live in DATA_DIR by default (NOT ~/.grok)
+# Override with GROK2API_AUTH_FILE / GROK2API_MODELS_CACHE if needed.
+AUTH_FILE = Path(os.getenv("GROK2API_AUTH_FILE", DATA_DIR / "auth.json"))
+MODELS_CACHE = Path(
+    os.getenv("GROK2API_MODELS_CACHE", DATA_DIR / "models_cache.json")
+)
+
+# Client headers for upstream proxy (version string only — no local CLI binary)
+# Keep surface as grok-cli so cli-chat-proxy accepts the session.
+CLI_VERSION = os.getenv("GROK2API_CLI_VERSION", "0.2.93")
+CLIENT_SURFACE = os.getenv("GROK2API_CLIENT_SURFACE", "grok-cli")
+CLIENT_IDENTIFIER = os.getenv("GROK2API_CLIENT_IDENTIFIER", "grokcli-2api")
+
+# Default model when client omits / sends generic names
+DEFAULT_MODEL = os.getenv("GROK2API_DEFAULT_MODEL", "grok-4.5")
+
+# Account rotation mode (also changeable in admin UI / settings.json)
+# round_robin | random | least_used  (all accounts equal; no primary)
+# Empty → settings.json / default round_robin
+ACCOUNT_MODE = os.getenv("GROK2API_ACCOUNT_MODE", "").strip().lower()
+
+# Sticky account per conversation (avoid mid-chat account rotation breaking memory)
+CONVERSATION_AFFINITY = os.getenv(
+    "GROK2API_CONVERSATION_AFFINITY", "1"
+).lower() not in ("0", "false", "no")
+# How long to keep conversation→account binding (seconds)
+AFFINITY_TTL = float(os.getenv("GROK2API_AFFINITY_TTL", "7200"))
+AFFINITY_MAX = int(os.getenv("GROK2API_AFFINITY_MAX", "5000"))
+
+# Background token maintenance interval (seconds) for multi-account on Linux
+TOKEN_MAINTAIN_INTERVAL = float(os.getenv("GROK2API_TOKEN_MAINTAIN_INTERVAL", "300"))
+
+# Background model health probe interval (seconds). 0 = only on demand / on error
+MODEL_HEALTH_INTERVAL = float(os.getenv("GROK2API_MODEL_HEALTH_INTERVAL", "600"))
+# Auto-disable account from rotation when model probe fails
+MODEL_HEALTH_AUTO_DISABLE = os.getenv(
+    "GROK2API_MODEL_HEALTH_AUTO_DISABLE", "1"
+).lower() not in ("0", "false", "no")
+# Models to probe periodically (comma-separated); empty = DEFAULT_MODEL only
+_probe_env = os.getenv("GROK2API_PROBE_MODELS", "").strip()
+PROBE_MODELS: list[str] = (
+    [m.strip() for m in _probe_env.split(",") if m.strip()]
+    if _probe_env
+    else [DEFAULT_MODEL]
+)
+
+# xAI OIDC (public client — device code + refresh; no local CLI binary)
+GROK_CLI_CLIENT_ID = os.getenv(
+    "GROK2API_OIDC_CLIENT_ID",
+    "b1a00492-073a-47ea-816f-4c329264a828",
+)
+OIDC_ISSUER = os.getenv("GROK2API_OIDC_ISSUER", "https://auth.x.ai")
+OIDC_DEVICE_URL = os.getenv(
+    "GROK2API_OIDC_DEVICE_URL",
+    f"{OIDC_ISSUER.rstrip('/')}/oauth2/device/code",
+)
+OIDC_TOKEN_URL = os.getenv(
+    "GROK2API_OIDC_TOKEN_URL",
+    f"{OIDC_ISSUER.rstrip('/')}/oauth2/token",
+)
+OIDC_SCOPES = os.getenv(
+    "GROK2API_OIDC_SCOPES",
+    "openid profile email offline_access grok-cli:access api:access "
+    "conversations:read conversations:write",
+)
+# Auto-refresh access tokens this many seconds before expiry
+TOKEN_REFRESH_SKEW = float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "120"))
+
+# Force stream upstream (most models only support streaming on this proxy)
+FORCE_UPSTREAM_STREAM = os.getenv("GROK2API_FORCE_STREAM", "1") not in (
+    "0",
+    "false",
+    "False",
+)
+
+# When True (default): if any managed key exists OR env API_KEY set, require a key.
+# When no keys at all, open access (dev mode) unless REQUIRE_API_KEY=1
+REQUIRE_API_KEY = os.getenv("GROK2API_REQUIRE_API_KEY", "auto")
+
+# Request timeout (seconds) for non-stream collection
+TIMEOUT = float(os.getenv("GROK2API_TIMEOUT", "600"))
+
+# Map common aliases -> real model ids (OpenAI + Anthropic client defaults)
+MODEL_ALIASES: dict[str, str] = {
+    "gpt-4": DEFAULT_MODEL,
+    "gpt-4o": DEFAULT_MODEL,
+    "gpt-3.5-turbo": DEFAULT_MODEL,
+    "gpt-4-turbo": DEFAULT_MODEL,
+    "claude": DEFAULT_MODEL,
+    "claude-3": DEFAULT_MODEL,
+    "claude-3-5-sonnet": DEFAULT_MODEL,
+    "claude-3-5-sonnet-20240620": DEFAULT_MODEL,
+    "claude-3-5-sonnet-20241022": DEFAULT_MODEL,
+    "claude-3-5-haiku": DEFAULT_MODEL,
+    "claude-3-5-haiku-20241022": DEFAULT_MODEL,
+    "claude-3-haiku": DEFAULT_MODEL,
+    "claude-3-haiku-20240307": DEFAULT_MODEL,
+    "claude-3-opus": DEFAULT_MODEL,
+    "claude-3-opus-20240229": DEFAULT_MODEL,
+    "claude-3-sonnet": DEFAULT_MODEL,
+    "claude-3-sonnet-20240229": DEFAULT_MODEL,
+    "claude-sonnet-4": DEFAULT_MODEL,
+    "claude-sonnet-4-0": DEFAULT_MODEL,
+    "claude-sonnet-4-20250514": DEFAULT_MODEL,
+    "claude-sonnet-4-5": DEFAULT_MODEL,
+    "claude-sonnet-4-5-20250929": DEFAULT_MODEL,
+    "claude-opus-4": DEFAULT_MODEL,
+    "claude-opus-4-0": DEFAULT_MODEL,
+    "claude-opus-4-20250514": DEFAULT_MODEL,
+    "claude-opus-4-5": DEFAULT_MODEL,
+    "claude-haiku-4": DEFAULT_MODEL,
+    "claude-haiku-4-5": DEFAULT_MODEL,
+    "claude-haiku-4-5-20251001": DEFAULT_MODEL,
+    "grok": DEFAULT_MODEL,
+    "grok-latest": DEFAULT_MODEL,
+    "grok-build": "grok-build",
+    "default": DEFAULT_MODEL,
+}
+
