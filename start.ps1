@@ -2,6 +2,31 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+if (-not (Test-Path ".env")) {
+    if (Test-Path ".env.example") {
+        Copy-Item ".env.example" ".env"
+        Write-Host "Created .env from .env.example — edit secrets as needed."
+    }
+}
+if (Test-Path ".env") {
+    Get-Content ".env" | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith("#")) { return }
+        $i = $line.IndexOf("=")
+        if ($i -lt 1) { return }
+        $name = $line.Substring(0, $i).Trim()
+        $val = $line.Substring($i + 1).Trim()
+        if ($val.StartsWith('"') -and $val.EndsWith('"') -and $val.Length -ge 2) {
+            $val = $val.Substring(1, $val.Length - 2)
+        } elseif ($val.StartsWith("'") -and $val.EndsWith("'") -and $val.Length -ge 2) {
+            $val = $val.Substring(1, $val.Length - 2)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($name)) {
+            Set-Item -Path "Env:$name" -Value $val
+        }
+    }
+}
+
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     Write-Error "python not found in PATH. Install Python 3.10+ first."
 }

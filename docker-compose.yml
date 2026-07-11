@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     image: grokcli-2api:local
     container_name: grokcli-2api
+    # Copy template first: cp .env.example .env  (then edit secrets)
+    env_file:
+      - path: .env
+        required: false
     ports:
       - "3000:3000"
     environment:

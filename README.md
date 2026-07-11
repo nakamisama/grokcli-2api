@@ -97,9 +97,9 @@ GROK2API_REASONING_COMPAT=off
 
 ```powershell
 cd $env:USERPROFILE\Desktop\grokcli-2api
+copy .env.example .env
+# 编辑 .env（至少改 GROK2API_ADMIN_PASSWORD）
 pip install -r requirements.txt
-python app.py
-# 或
 .\start.ps1
 ```
 
@@ -107,21 +107,11 @@ python app.py
 
 ```bash
 cd /opt/grokcli-2api   # 或你的部署目录
+cp .env.example .env
+# 编辑 .env：管理密码、MoeMail / YesCaptcha 等
+# 默认 GROK2API_REASONING_COMPAT=off（sub2api / Claude Code 推荐）
+
 python3 -m pip install -r requirements.txt
-
-export GROK2API_HOST=0.0.0.0
-export GROK2API_PORT=3000
-export GROK2API_OPEN_BROWSER=0
-export GROK2API_ADMIN_PASSWORD='your-strong-password'
-export GROK2API_ACCOUNT_MODE=round_robin
-export GROK2API_REASONING_COMPAT=off   # sub2api/Claude Code 推荐；仅 content 中继才用 think_tag
-
-# 可选：协议注册
-export GROK2API_MOEMAIL_API_KEY='mk_xxx'
-export GROK2API_MOEMAIL_BASE_URL='https://moemail.521884.xyz'
-export GROK2API_MOEMAIL_DOMAIN='lolicc.online'
-export GROK2API_YESCAPTCHA_KEY='your-yescaptcha-key'
-
 chmod +x start.sh
 ./start.sh
 # 后台
@@ -131,8 +121,10 @@ nohup ./start.sh > grok2api.log 2>&1 &
 ### Docker
 
 ```bash
+cp .env.example .env
+# 编辑 .env 后启动
 docker compose up -d --build
-# 或
+# 或一键重建（缺 .env 时会从模板复制）
 ./docker-rebuild.sh
 ```
 
@@ -350,6 +342,17 @@ else:
 ---
 
 ## 环境变量
+
+推荐用模板文件管理本地配置（**不要**把真实 `.env` 提交进 git）：
+
+```bash
+cp .env.example .env
+# 按需修改 .env
+```
+
+- 本地 / `start.sh`：自动 `source .env`
+- Docker Compose：`env_file: .env`
+- 本机 production override：可 `cp .env.example grokcli-2api.env`（文件已 gitignore）
 
 ### 基础
 

@@ -23,6 +23,19 @@ print('engine_dir_present=', Path('grok-build-auth/xconsole_client').exists())
 print('browser_runner_present=', Path('register_runner.py').exists())
 PY
 
+echo "== env =="
+if [[ ! -f .env ]]; then
+  if [[ -f .env.example ]]; then
+    cp .env.example .env
+    echo "Created .env from .env.example — edit secrets before production use."
+  else
+    echo "ERROR: missing .env and .env.example" >&2
+    exit 1
+  fi
+else
+  echo "using existing .env"
+fi
+
 echo "== docker stop/remove =="
 docker compose down --remove-orphans || true
 docker rm -f grokcli-2api 2>/dev/null || true

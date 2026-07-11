@@ -3,6 +3,22 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Ensure local env from template (never commit real .env)
+if [[ ! -f .env ]]; then
+  if [[ -f .env.example ]]; then
+    cp .env.example .env
+    echo "Created .env from .env.example — edit secrets (admin password, mail keys) as needed."
+  else
+    echo "WARN: .env.example missing; continuing with process environment only." >&2
+  fi
+fi
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
   echo "ERROR: python3 not found. Install Python 3.10+ first." >&2
   exit 1

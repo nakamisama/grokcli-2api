@@ -3,6 +3,13 @@ chcp 65001 >nul
 cd /d "%~dp0"
 title grokcli-2api
 
+if not exist ".env" (
+  if exist ".env.example" (
+    copy /Y ".env.example" ".env" >nul
+    echo Created .env from .env.example — edit secrets as needed.
+  )
+)
+
 echo.
 echo  === grokcli-2api ===
 echo  Working dir: %CD%
