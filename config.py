@@ -61,7 +61,8 @@ PUBLIC_BASE_URL = (
     or os.getenv("PUBLIC_BASE_URL")
     or ""
 ).strip().rstrip("/")
-# Legacy single key (still accepted if set). Prefer managed keys in data/keys.json
+# Legacy single key (still accepted if set). Prefer managed keys in PostgreSQL
+# (or keys.json only when STORE_BACKEND=file).
 API_KEY = os.getenv("GROK2API_API_KEY", "")
 
 # Admin console password bootstrap only.
@@ -79,13 +80,16 @@ UPSTREAM_BASE = os.getenv(
 # App data — fully self-contained under project (or GROK2API_DATA_DIR)
 APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("GROK2API_DATA_DIR", APP_ROOT / "data"))
+# File-mode / migration paths only. Hybrid runtime does not write these.
 KEYS_FILE = DATA_DIR / "keys.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 STATIC_DIR = APP_ROOT / "static"
 
-# Auth + model cache live in DATA_DIR by default (NOT ~/.grok)
-# Override with GROK2API_AUTH_FILE / GROK2API_MODELS_CACHE if needed.
+# Auth file path (file mode / admin export target). Model catalog lives in PostgreSQL.
+# Override with GROK2API_AUTH_FILE if needed. Hybrid runtime never mirrors here.
 AUTH_FILE = Path(os.getenv("GROK2API_AUTH_FILE", DATA_DIR / "auth.json"))
+# Deprecated: models_cache.json is no longer used at runtime. Kept only so old
+# env/docs don't break imports; migrate_json_to_pg may still read this path.
 MODELS_CACHE = Path(
     os.getenv("GROK2API_MODELS_CACHE", DATA_DIR / "models_cache.json")
 )
@@ -99,9 +103,9 @@ CLIENT_IDENTIFIER = os.getenv("GROK2API_CLIENT_IDENTIFIER", "grokcli-2api")
 # Default model when client omits / sends generic names
 DEFAULT_MODEL = os.getenv("GROK2API_DEFAULT_MODEL", "grok-4.5")
 
-# Account rotation mode (also changeable in admin UI / settings.json)
+# Account rotation mode (also changeable in admin UI / settings store)
 # round_robin | random | least_used  (all accounts equal; no primary)
-# Empty → settings.json / default round_robin
+# Empty → settings store / default round_robin
 ACCOUNT_MODE = os.getenv("GROK2API_ACCOUNT_MODE", "").strip().lower()
 
 # Sticky account per conversation (avoid mid-chat account rotation breaking memory)

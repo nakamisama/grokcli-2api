@@ -2538,7 +2538,7 @@ def _run_registration(
                 f"adapter_build={ADAPTER_BUILD}"
             )
         # Registration import is durable PostgreSQL (accounts + account_pool).
-        # auth.json is only an optional mirror for export tools.
+        # auth.json is not written at runtime in hybrid mode (export-only).
         if import_result.get("storage") and import_result.get("storage") != "postgres":
             print(
                 f"[grok-build-auth] WARN: import storage={import_result.get('storage')} "

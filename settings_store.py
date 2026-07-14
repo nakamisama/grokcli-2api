@@ -220,25 +220,12 @@ def _write_disk(data: dict[str, Any]) -> None:
                         pg.set_setting("sessions", data["sessions"])
                 except Exception:
                     pg.set_setting("sessions", data.get("sessions") or {})
-            # Mirror non-pool settings only (no account_pool JSON storage).
-            try:
-                _ensure()
-                tmp = SETTINGS_FILE.with_suffix(".tmp")
-                mirror = {
-                    k: v
-                    for k, v in data.items()
-                    if k not in ("account_pool",)
-                }
-                tmp.write_text(
-                    json.dumps(mirror, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-                tmp.replace(SETTINGS_FILE)
-                _mem_mtime_ns = _file_mtime_ns()
-            except Exception:
-                pass
+            # PostgreSQL is the durable store — do not mirror settings.json at runtime.
+            # settings.json remains only for STORE_BACKEND=file and migrate import.
             return
         except Exception:
             pass
+    # File-mode fallback (explicit STORE_BACKEND=file / PG unavailable).
     _ensure()
     tmp = SETTINGS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1100,7 +1087,7 @@ def _set_setting_value(key: str, value: Any) -> Any:
         try:
             pg.set_setting(key, value)
         except Exception:
-            # Still update local mem + mirror file so this worker keeps working.
+            # Still update local mem so this worker keeps working.
             pass
     with _lock:
         data = _load()

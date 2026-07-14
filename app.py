@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.66"
+APP_VERSION = "1.9.67"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -265,6 +265,26 @@ def _on_startup() -> None:
         )
     except Exception as e:  # noqa: BLE001
         print(f"  store: status unavailable ({e})")
+
+    # Seed model catalog into PostgreSQL when empty so multi-worker /v1/models
+    # reads a shared durable source of truth (no models_cache.json).
+    try:
+        from models import ensure_models_catalog_seeded
+
+        seed = ensure_models_catalog_seeded()
+        if seed.get("ok"):
+            print(
+                "  models catalog: "
+                + (
+                    f"seeded baseline into postgres (count={seed.get('count')})"
+                    if seed.get("seeded")
+                    else f"postgres ready (count={seed.get('count')})"
+                )
+            )
+        elif seed.get("error") and seed.get("error") != "pg disabled":
+            print(f"  (models catalog seed skipped: {seed.get('error')})")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (models catalog seed skipped: {e})")
 
     try:
         from oidc_auth import normalize_auth_file_keys
@@ -2006,6 +2026,15 @@ def _record_usage_safe(
         import usage_stats
 
         ctx = _usage_request_ctx.get() or {}
+        # Failed rows with null error/status make admin "断联" debugging opaque
+        # (looks like a silent drop). Always stamp a reason + status on !ok.
+        err_out = error
+        status_out = status_code
+        if not ok:
+            if err_out is None or not str(err_out).strip():
+                err_out = "request_failed"
+            if status_out is None:
+                status_out = 502
         usage_stats.record_usage(
             usage=usage,
             ok=ok,
@@ -2017,9 +2046,9 @@ def _record_usage_safe(
             path=path or ctx.get("path"),
             client_ip=client_ip or ctx.get("client_ip"),
             user_agent=user_agent or ctx.get("user_agent"),
-            status_code=status_code,
+            status_code=status_out,
             latency_ms=latency_ms,
-            error=error,
+            error=err_out,
             detail=detail,
         )
     except Exception:
@@ -2042,19 +2071,34 @@ class _DisconnectProbe:
     Starlette ``request.is_disconnected()`` can flip true once under write
     backpressure or briefly when a proxy probes the socket, then go false
     again. A single hit used to permanently set ``client_gone`` and hard-cut
-    mid-turn (Claude Code / sub2api stop scheduling). Require consecutive
-    true hits before treating the client as gone; probe exceptions never count.
+    mid-turn (Claude Code / sub2api stop scheduling).
+
+    Require several consecutive true hits **and** a minimum wall-clock span so
+    a single backpressure stall (many true probes within ~100ms) does not latch.
+    Probe exceptions never count.
     """
 
-    def __init__(self, hits_needed: int | None = None) -> None:
+    def __init__(
+        self,
+        hits_needed: int | None = None,
+        min_span_sec: float | None = None,
+    ) -> None:
         raw = hits_needed
         if raw is None:
             try:
-                raw = int(os.getenv("GROK2API_DISCONNECT_HITS", "2") or 2)
+                raw = int(os.getenv("GROK2API_DISCONNECT_HITS", "3") or 3)
             except (TypeError, ValueError):
-                raw = 2
+                raw = 3
         self.hits_needed = max(1, min(8, int(raw)))
+        span = min_span_sec
+        if span is None:
+            try:
+                span = float(os.getenv("GROK2API_DISCONNECT_SPAN_SEC", "1.5") or 1.5)
+            except (TypeError, ValueError):
+                span = 1.5
+        self.min_span_sec = max(0.0, min(30.0, float(span)))
         self.hits = 0
+        self.first_hit_at: float | None = None
         self.gone = False
 
     async def check(self, probe) -> bool:
@@ -2068,12 +2112,20 @@ class _DisconnectProbe:
             # Backpressure / closed-transport races: do not sticky-latch.
             return False
         if disconnected:
+            now = time.monotonic()
+            if self.first_hit_at is None:
+                self.first_hit_at = now
             self.hits += 1
-            if self.hits >= self.hits_needed:
+            span_ok = (now - self.first_hit_at) >= self.min_span_sec
+            # hits_needed==1 keeps old "immediate" behaviour for tests/debug.
+            if self.hits >= self.hits_needed and (
+                self.hits_needed <= 1 or span_ok or self.min_span_sec <= 0
+            ):
                 self.gone = True
                 return True
             return False
         self.hits = 0
+        self.first_hit_at = None
         return False
 
 
@@ -5848,9 +5900,10 @@ async def _stream_anthropic_with_failover_inner(
                         continue
                     if timing is not None:
                         timing.emit(ok=False, error=last_err)
-                    yield anth.anthropic_stream_error(
+                    for _term_ev in anth.anthropic_stream_terminal_error(
                         last_err, err_type="api_error"
-                    )
+                    ):
+                        yield _term_ev
                     return
 
                 # Defer message_start until real model output so empty HTTP 200 can still
@@ -6023,9 +6076,10 @@ async def _stream_anthropic_with_failover_inner(
                         if not stream_started:
                             for ev in _open_anthropic_stream():
                                 yield ev
-                        yield anth.anthropic_stream_error(
+                        for _term_ev in anth.anthropic_stream_terminal_error(
                             empty_err, err_type="api_error"
-                        )
+                        ):
+                            yield _term_ev
                         return
                     # Drain complete: now emit terminal events with best usage
                     fr = held_finish or (
@@ -6071,9 +6125,10 @@ async def _stream_anthropic_with_failover_inner(
                     except Exception:
                         if stream_started:
                             try:
-                                yield anth.anthropic_stream_error(
+                                for _term_ev in anth.anthropic_stream_terminal_error(
                                     "client disconnected", err_type="api_error"
-                                )
+                                ):
+                                    yield _term_ev
                             except Exception:
                                 pass
                     _record_usage_safe(
@@ -6127,9 +6182,10 @@ async def _stream_anthropic_with_failover_inner(
                         if not stream_started:
                             for ev in _open_anthropic_stream():
                                 yield ev
-                        yield anth.anthropic_stream_error(
+                        for _term_ev in anth.anthropic_stream_terminal_error(
                             body_err, err_type="api_error"
-                        )
+                        ):
+                            yield _term_ev
                         return
                     try:
                         data = json.loads(raw)
@@ -6162,9 +6218,10 @@ async def _stream_anthropic_with_failover_inner(
                         if not stream_started:
                             for ev in _open_anthropic_stream():
                                 yield ev
-                        yield anth.anthropic_stream_error(
+                        for _term_ev in anth.anthropic_stream_terminal_error(
                             empty_err, err_type="api_error"
-                        )
+                        ):
+                            yield _term_ev
                         return
                     else:
                         if isinstance(data.get("usage"), dict):
@@ -6229,9 +6286,10 @@ async def _stream_anthropic_with_failover_inner(
                             if not stream_started:
                                 for ev in _open_anthropic_stream():
                                     yield ev
-                            yield anth.anthropic_stream_error(
+                            for _term_ev in anth.anthropic_stream_terminal_error(
                                 empty_err, err_type="api_error"
-                            )
+                            ):
+                                yield _term_ev
                             return
                         _note_success_once()
                         for ev in _open_anthropic_stream():
@@ -6320,9 +6378,10 @@ async def _stream_anthropic_with_failover_inner(
             # Prefer a clean Anthropic error/stop over a hard cut when stream open.
             if stream_started:
                 try:
-                    yield anth.anthropic_stream_error(
+                    for _term_ev in anth.anthropic_stream_terminal_error(
                         "stream cancelled", err_type="api_error"
-                    )
+                    ):
+                        yield _term_ev
                 except Exception:
                     pass
             return
@@ -6341,20 +6400,23 @@ async def _stream_anthropic_with_failover_inner(
             )
             # Mid-stream failures cannot safely failover for secondary relays
             if stream_started:
-                yield anth.anthropic_stream_error(
+                for _term_ev in anth.anthropic_stream_terminal_error(
                     last_err or "proxy_error", err_type="api_error"
-                )
+                ):
+                    yield _term_ev
                 return
             if idx < len(chain) - 1:
                 continue
-            yield anth.anthropic_stream_error(
+            for _term_ev in anth.anthropic_stream_terminal_error(
                 last_err or "proxy_error", err_type="api_error"
-            )
+            ):
+                yield _term_ev
             return
 
-    yield anth.anthropic_stream_error(
+    for _term_ev in anth.anthropic_stream_terminal_error(
         _sanitize_upstream_error_message(last_err or "", 503) or "All accounts failed", err_type="api_error"
-    )
+    ):
+        yield _term_ev
 
 
 def _static_file_response(rel_path: str):

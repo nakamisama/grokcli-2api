@@ -1278,6 +1278,12 @@ def anthropic_stream_message_stop() -> str:
 
 
 def anthropic_stream_error(message: str, err_type: str = "api_error") -> str:
+    """Emit Anthropic error event.
+
+    Prefer :func:`anthropic_stream_terminal_error` at the end of a stream so
+    clients also receive ``message_stop`` (sub2api treats a bare error without
+    a terminal stop as ``missing terminal event`` / hard disconnect).
+    """
     return _sse_event(
         "error",
         {
@@ -1285,6 +1291,16 @@ def anthropic_stream_error(message: str, err_type: str = "api_error") -> str:
             "error": {"type": err_type, "message": message},
         },
     )
+
+
+def anthropic_stream_terminal_error(
+    message: str, err_type: str = "api_error"
+) -> list[str]:
+    """Error + message_stop so secondary relays close the SSE envelope cleanly."""
+    return [
+        anthropic_stream_error(message, err_type=err_type),
+        anthropic_stream_message_stop(),
+    ]
 
 
 def anthropic_stream_ping() -> str:

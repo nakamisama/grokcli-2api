@@ -2970,7 +2970,7 @@ async def delete_accounts_batch(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Delete multiple accounts from durable store (PostgreSQL + file mirror)."""
+    """Delete multiple accounts from durable store (PostgreSQL, or auth.json in file mode)."""
     require_admin(request, x_admin_token)
     ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
     if not ids:
@@ -3563,10 +3563,20 @@ async def admin_models(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
+    meta: dict = {}
+    try:
+        from store import models_pg
+
+        if models_pg.enabled():
+            meta = models_pg.get_meta() or {}
+    except Exception:
+        pass
     return {
         "object": "list",
         "data": load_models_from_cache(),
         "default_model": DEFAULT_MODEL,
+        "storage": "postgres",
+        "meta": meta,
     }
 
 
@@ -3575,7 +3585,7 @@ async def models_sync(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Fetch model list from cli-chat-proxy and update models_cache.json."""
+    """Fetch model list from cli-chat-proxy and store in PostgreSQL."""
     require_admin(request, x_admin_token)
     result = sync_models_from_upstream()
     if not result.get("ok"):
@@ -3585,7 +3595,11 @@ async def models_sync(
         action="models.sync",
         summary=f"同步上游模型 {result.get('count') or ''}",
         target_type="models",
-        detail={"count": result.get("count")},
+        detail={
+            "count": result.get("count"),
+            "storage": "postgres",
+            "pg_count": result.get("pg_count"),
+        },
     )
     return result
 

@@ -179,7 +179,7 @@ const PAGE_META = {
   accounts: { title: "账号 / 轮询", sub: "Grok 账号、设备码登录、额度与导入导出" },
   usage: { title: "用量", sub: "Token 消耗与请求使用情况（今日 / 近 N 天 / 累计）" },
   logs: { title: "任务日志", sub: "查询后台任务结果（协议注册、SSO 导入、测活、Token 续期等）" },
-  models: { title: "模型", sub: "上游模型缓存与探测结果" },
+  models: { title: "模型", sub: "上游模型目录（入库）与探测结果" },
   settings: { title: "系统设置", sub: "修改管理员密码、轮询策略与 sub2api / 维护参数" },
   guide: { title: "接入指南", sub: "OpenAI / Anthropic 客户端配置示例" },
 };
@@ -1896,6 +1896,8 @@ async function loadModels() {
     // Always replace — never keep a stale single-model dashboard snapshot.
     dashCache.models = list.slice();
     if (r && r.default_model) dashCache.default_model = r.default_model;
+    if (r && r.storage) dashCache.models_storage = r.storage;
+    if (r && r.meta) dashCache.models_meta = r.meta;
   } catch (e) {
     console.warn("loadModels failed", e);
     try { toast((e && e.message) || "加载模型列表失败", false); } catch (_) {}
@@ -1914,8 +1916,8 @@ function renderModels() {
     const sub = head && head.querySelector(".g2a-card-head p");
     if (sub) {
       sub.textContent = models.length
-        ? `上游 + 本地模型缓存，共 ${models.length} 个。可同步并查看探测结果。`
-        : "上游模型缓存。可同步并查看探测结果。";
+        ? `已从上游同步到数据库，共 ${models.length} 个模型。可重新同步并查看探测结果。`
+        : "模型目录为空。请点「同步上游模型」拉取并写入数据库。";
     }
   } catch (_) {}
   tbody.innerHTML = models.map(m => `

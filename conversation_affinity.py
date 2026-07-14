@@ -10,16 +10,10 @@ Fingerprint priority (callers may re-order for Responses):
   4. OpenAI `user` + conversation root
   5. Stable hash of conversation root (first user + weak system salt)
 
-Bindings are kept in memory and flushed to data/affinity.json so restarts
-do not drop sticky sessions within TTL.
+When REDIS_URL is set (production hybrid), bindings live in Redis (TTL keys)
+so multi-worker processes share sticky sessions. No affinity.json is written.
 
-When REDIS_URL is set, bindings live in Redis (TTL keys) so multi-worker
-processes share sticky sessions.
-
-Response-chain entries may also store ``session_fp``: the stable multi-turn
-identity established on the first turn. Later turns with a new
-``previous_response_id`` resolve that same session_fp so Claude Code /
-sub2api keep stickiness even when system/tools text churns every turn.
+affinity.json is only a single-process file-mode fallback when Redis is off.
 """
 
 from __future__ import annotations
@@ -90,10 +84,13 @@ def _flush_interval() -> float:
 
 
 def _ensure_loaded() -> None:
+    """Load affinity.json only for file-mode fallback (Redis off)."""
     global _loaded
     if _loaded:
         return
     _loaded = True
+    if _redis_mode():
+        return
     try:
         if not AFFINITY_FILE.is_file():
             return
@@ -126,6 +123,8 @@ def _ensure_loaded() -> None:
 
 def _schedule_flush_locked() -> None:
     global _dirty, _last_flush
+    if _redis_mode():
+        return
     _dirty = True
     now = time.time()
     if now - _last_flush >= _flush_interval():
@@ -133,7 +132,11 @@ def _schedule_flush_locked() -> None:
 
 
 def _flush_locked() -> None:
+    """Persist in-memory map to affinity.json (file-mode only)."""
     global _dirty, _last_flush
+    if _redis_mode():
+        _dirty = False
+        return
     _dirty = False
     _last_flush = time.time()
     try:
@@ -153,6 +156,8 @@ def _flush_locked() -> None:
 
 
 def flush() -> None:
+    if _redis_mode():
+        return
     with _lock:
         _ensure_loaded()
         _flush_locked()
@@ -528,7 +533,7 @@ def status() -> dict[str, Any]:
                 "max_entries": _max_entries(),
                 "backend": "redis",
                 "active": sample.get("active", 0),
-                "persist_file": str(AFFINITY_FILE),
+                "persist_file": None,
                 "sample": sample.get("sample") or [],
             }
         except Exception as e:  # noqa: BLE001
