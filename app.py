@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.68"
+APP_VERSION = "1.9.69"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -5673,7 +5673,20 @@ async def openai_responses(
                                 # No client bytes yet → silent account failover.
                                 if (not stream_started) and idx < len(chain) - 1:
                                     continue
-                                for frame in streamer.fail(empty_err):
+                                # Always emit a Responses terminal. complete() used
+                                # to set _closed on empty turns, which made fail() a
+                                # no-op and left sub2api without response.failed/DONE
+                                # ("stream usage incomplete: missing terminal event").
+                                fail_frames = list(streamer.fail(empty_err))
+                                if not fail_frames:
+                                    fail_frames = list(
+                                        oai_resp.failed_responses_sse(
+                                            response_id=response_id,
+                                            message=empty_err,
+                                            model=model,
+                                        )
+                                    )
+                                for frame in fail_frames:
                                     yield frame
                                 return
 
@@ -5723,7 +5736,20 @@ async def openai_responses(
                                 last_error = empty_err
                                 if (not stream_started) and idx < len(chain) - 1:
                                     continue
-                                for frame in streamer.fail(empty_err):
+                                # Always emit a Responses terminal. complete() used
+                                # to set _closed on empty turns, which made fail() a
+                                # no-op and left sub2api without response.failed/DONE
+                                # ("stream usage incomplete: missing terminal event").
+                                fail_frames = list(streamer.fail(empty_err))
+                                if not fail_frames:
+                                    fail_frames = list(
+                                        oai_resp.failed_responses_sse(
+                                            response_id=response_id,
+                                            message=empty_err,
+                                            model=model,
+                                        )
+                                    )
+                                for frame in fail_frames:
                                     yield frame
                                 return
                             # Soft disconnect still needs a clean terminal (completed/failed + DONE).

@@ -1160,6 +1160,9 @@ class ResponsesLiveStreamer:
         self._tool_done: set[int] = set()
         self._output_index = 0
         self._text_output_index = 0
+        # _closed means a terminal event (completed/failed + DONE) was shipped.
+        # Empty complete() attempts must NOT set this, or fail() becomes a no-op
+        # and sub2api reports "stream usage incomplete: missing terminal event".
         self._closed = False
 
     def _emit(self, event: str, payload: dict[str, Any]) -> str:
@@ -1868,7 +1871,9 @@ class ResponsesLiveStreamer:
             force_flush_partial_tools and self._any_shipable_tool(terminal=True)
         )
         if not already and not can_ship_strict and not can_ship_terminal:
-            self._closed = True
+            # Leave _closed=False so the caller can still emit response.failed
+            # via fail(). Closing here made empty turns look like TCP drops to
+            # sub2api ("stream usage incomplete: missing terminal event").
             return []
 
         # Open envelope FIRST (seq 0,1) before any tool/text body events.
@@ -1888,13 +1893,12 @@ class ResponsesLiveStreamer:
 
         if not self.has_client_payload() and not has_text:
             # Safety: should be unreachable after the pre-check, but never emit
-            # an empty completed envelope.
-            self._closed = True
+            # an empty completed envelope. Keep stream reopenable for fail().
             return []
 
         final = self._build_completed_response(usage=usage, reasoning=reasoning or "")
         if not final.get("output"):
-            self._closed = True
+            # Built envelope but no output items — treat as empty, allow fail().
             return []
 
         frames.append(

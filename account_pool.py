@@ -1375,10 +1375,23 @@ def report_failure(
                 headers=headers,
                 model_soft_blocked=bool(soft_blocked),
             )
+    # Empty HTTP 200 (no content/tool_calls) is a transient upstream glitch —
+    # common under load. Do not stack multi-minute cooldowns that empty the
+    # pool and make sub2api report "no available accounts".
+    err_l = (error or "").lower()
+    empty_upstream = (
+        "empty model output" in err_l
+        or "no content/tool_calls" in err_l
+        or "no client-visible content" in err_l
+    )
     # Non free-usage failures: stack a generic status entry bound to account.
     entry = {
-        "kind": "request_fail",
-        "code": f"http_{status_code}" if status_code else "request_fail",
+        "kind": "empty_upstream" if empty_upstream else "request_fail",
+        "code": (
+            "empty_upstream"
+            if empty_upstream
+            else (f"http_{status_code}" if status_code else "request_fail")
+        ),
         "model": model,
         "source": "live",
         "status_code": status_code,
@@ -1387,7 +1400,12 @@ def report_failure(
     }
     stack = stack_status_entry(meta, entry)
     new_count = len(stack)
-    until = _now() + max(float(cooldown or 60.0), 60.0) * max(1, new_count)
+    if empty_upstream:
+        # Short sticky skip only (8–20s), ignore stack multiplier.
+        base = max(8.0, min(float(cooldown or 12.0), 20.0))
+        until = _now() + base
+    else:
+        until = _now() + max(float(cooldown or 60.0), 60.0) * max(1, new_count)
     err_store = (error or "")[:300]
     if err_store.startswith("{") and len(err_store) > 160:
         err_store = err_store[:160] + "…"
@@ -1399,7 +1417,7 @@ def report_failure(
                 "cooldown_count": new_count,
                 "pool_status": "cooldown",
                 "cooldown_until": until,
-                "cooldown_sec": float(new_count),
+                "cooldown_sec": float(new_count if not empty_upstream else base),
                 "cooldown_reason": err_store,
                 "cooldown_code": entry["code"],
                 "cooldown_model": model,
@@ -1421,7 +1439,7 @@ def report_failure(
         cooldown_until=until,
         consecutive_fails=streak,
         last_status_code=status_code,
-        cooldown_sec=float(new_count),
+        cooldown_sec=float(new_count if not empty_upstream else base),
     )
     print(
         f"  [pool] live fail → cooldown account={account_id[:48]} "
@@ -1431,7 +1449,7 @@ def report_failure(
     )
     return {
         "action": "cooldown",
-        "kind": "request_fail",
+        "kind": "empty_upstream" if empty_upstream else "request_fail",
         "account_id": account_id,
         "cooldown_code": entry["code"],
         "cooldown_count": new_count,
