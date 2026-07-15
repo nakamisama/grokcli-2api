@@ -8,7 +8,12 @@ Fingerprint priority (callers may re-order for Responses):
   2. OpenAI ``prompt_cache_key`` (alone — do not fold message root)
   3. Responses ``previous_response_id`` chain → linked session_fp + account
   4. OpenAI `user` + conversation root
-  5. Stable hash of conversation root (first user + weak system salt)
+  5. Messages content hash fallback (CPA-style short/full)
+  6. Stable hash of conversation root (first user + weak system salt)
+
+Optional ``model`` scopes the fingerprint so the same client session on a
+different model does not inherit a stale account binding (CPA
+``provider::session::model`` pattern).
 
 When REDIS_URL is set (production hybrid), bindings live in Redis (TTL keys)
 so multi-worker processes share sticky sessions. No affinity.json is written.
@@ -37,6 +42,12 @@ _dirty = False
 _last_flush = 0.0
 
 AFFINITY_FILE = Path(os.getenv("GROK2API_AFFINITY_FILE", DATA_DIR / "affinity.json"))
+
+# Claude Code embeds session ids as ``session_<uuid>`` inside metadata.user_id.
+_CLAUDE_SESSION_RE = re.compile(r"session_[0-9a-fA-F-]{8,}")
+# Cap message-hash material so huge tool dumps cannot explode CPU.
+_MSG_HASH_MAX_CHARS = 48_000
+_MSG_HASH_MAX_MSGS = 48
 
 
 def _redis_mode() -> bool:
@@ -208,6 +219,104 @@ def _msg_role_content(m: Any) -> tuple[str, str]:
     return "", ""
 
 
+def _normalize_model_scope(model: str | None) -> str | None:
+    """Scope affinity by resolved model id (skip empty / placeholder)."""
+    if not model:
+        return None
+    m = str(model).strip().lower()
+    if not m or m in ("default", "auto", "string", "null", "none"):
+        return None
+    # Keep short; aliases already resolved by callers via resolve_model.
+    return m[:80]
+
+
+def _fp_parts_base(*, api_key_id: str | None = None, model: str | None = None) -> list[str]:
+    parts: list[str] = []
+    if api_key_id:
+        parts.append(f"key:{api_key_id}")
+    m = _normalize_model_scope(model)
+    if m:
+        parts.append(f"model:{m}")
+    return parts
+
+
+def _finalize_fp(parts: list[str]) -> str:
+    return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def _message_hash_material(messages: list[Any] | None, *, mode: str) -> str | None:
+    """CPA-style messages content hash.
+
+    ``short``: only the first non-system/developer message (stable first turn).
+    ``full``: all non-system messages (stable multi-turn when no client session).
+    """
+    if not messages:
+        return None
+    chunks: list[str] = []
+    total = 0
+    count = 0
+    for m in messages:
+        role, content = _msg_role_content(m)
+        r = (role or "").lower()
+        if r in ("system", "developer"):
+            continue
+        text = (content or "").strip()
+        if not text:
+            # Still include role markers so empty tool rounds stay distinct.
+            piece = f"{r}:"
+        else:
+            piece = f"{r}:{text}"
+        if mode == "short":
+            if not text and r not in ("user", "human"):
+                continue
+            chunks.append(piece[:4000])
+            break
+        remain = _MSG_HASH_MAX_CHARS - total
+        if remain <= 0 or count >= _MSG_HASH_MAX_MSGS:
+            break
+        if len(piece) > remain:
+            piece = piece[:remain]
+        chunks.append(piece)
+        total += len(piece)
+        count += 1
+    if not chunks:
+        return None
+    raw = "\n".join(chunks)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def messages_content_fingerprint(
+    messages: list[Any] | None,
+    *,
+    api_key_id: str | None = None,
+    model: str | None = None,
+    mode: str | None = None,
+) -> str | None:
+    """Fingerprint from message contents when no explicit session id is present.
+
+    Mirrors CLIProxyAPI SessionAffinitySelector fallback:
+      - first turn (no assistant yet) → short hash of first user message
+      - multi-turn → full hash of non-system messages
+    """
+    if not _enabled() or not messages:
+        return None
+    has_assistant = False
+    for m in messages:
+        role, _ = _msg_role_content(m)
+        if (role or "").lower() in ("assistant", "model"):
+            has_assistant = True
+            break
+    use_mode = (mode or ("full" if has_assistant else "short")).lower()
+    if use_mode not in ("short", "full"):
+        use_mode = "full" if has_assistant else "short"
+    digest = _message_hash_material(messages, mode=use_mode)
+    if not digest:
+        return None
+    parts = _fp_parts_base(api_key_id=api_key_id, model=model)
+    parts.append(f"msg{use_mode}:{digest}")
+    return _finalize_fp(parts)
+
+
 def conversation_fingerprint(
     messages: list[Any] | None,
     *,
@@ -215,6 +324,7 @@ def conversation_fingerprint(
     conversation_id: str | None = None,
     api_key_id: str | None = None,
     prompt_cache_key: str | None = None,
+    model: str | None = None,
 ) -> str | None:
     """
     Stable id for one multi-turn chat. Same sticky identity → same fingerprint
@@ -224,31 +334,33 @@ def conversation_fingerprint(
       1. conversation_id (explicit client session / chat id)
       2. prompt_cache_key (OpenAI / sub2api / Claude Code cache sticky key)
       3. user + conversation root
-      4. conversation root alone
+      4. messages content hash (CPA short/full fallback)
+      5. conversation root alone
 
     When ``prompt_cache_key`` is present it is used *alone* (plus optional
-    api_key_id). We intentionally do **not** fold conversation root into the
-    fingerprint: Responses / partial-history clients change root every turn,
+    api_key_id / model). We intentionally do **not** fold conversation root into
+    the fingerprint: Responses / partial-history clients change root every turn,
     and mixing root would break account stickiness that prompt caching needs.
+
+    ``model`` (when provided) scopes the fingerprint so the same session on a
+    different model does not reuse a stale account binding.
     """
     if not _enabled():
         return None
 
-    parts: list[str] = []
-    if api_key_id:
-        parts.append(f"key:{api_key_id}")
+    parts = _fp_parts_base(api_key_id=api_key_id, model=model)
 
     cid = (conversation_id or "").strip()
     if cid:
         parts.append(f"cid:{cid}")
-        return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+        return _finalize_fp(parts)
 
     pck = (prompt_cache_key or "").strip()
     if pck:
         # Stable cache key is the multi-turn identity. Do not mix message root —
         # partial histories / Responses input would change it every turn.
         parts.append(f"pck:{pck}")
-        return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+        return _finalize_fp(parts)
 
     u = (user or "").strip()
     if u and u.lower() not in ("user", "default", "anonymous", "string"):
@@ -256,13 +368,22 @@ def conversation_fingerprint(
         root = _conversation_root(messages)
         if root:
             parts.append(f"root:{root}")
-        return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+        return _finalize_fp(parts)
+
+    # CPA-style messages hash before weak root-only. Multi-turn clients that
+    # omit conversation_id / prompt_cache_key still stick when history grows
+    # consistently (full hash). First-turn short hash covers brand-new chats.
+    msg_fp = messages_content_fingerprint(
+        messages, api_key_id=api_key_id, model=model
+    )
+    if msg_fp:
+        return msg_fp
 
     root = _conversation_root(messages)
     if not root:
         return None
     parts.append(f"root:{root}")
-    return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+    return _finalize_fp(parts)
 
 
 def response_chain_fingerprint(
@@ -520,6 +641,40 @@ def clear_affinity(fingerprint: str | None) -> None:
             _schedule_flush_locked()
 
 
+def clear_affinity_for_account(account_id: str | None) -> int:
+    """Drop all sticky bindings pointing at a dead / disabled account.
+
+    Mirrors CLIProxyAPI SessionAffinitySelector.InvalidateAuth — once an auth
+    is unusable, keep later turns from pinning to it via a stale cache entry.
+    Returns the number of entries cleared (best-effort).
+
+    Redis mode: SCAN + delete matching keys. Always also scrub the in-process
+    map so a Redis outage that fell back to memory for bind/get does not leave
+    stale pins behind.
+    """
+    if not account_id:
+        return 0
+    aid = str(account_id)
+    removed = 0
+    if _redis_mode():
+        try:
+            from store import affinity_redis
+
+            removed += int(affinity_redis.clear_for_account(aid) or 0)
+        except Exception:
+            pass
+    # Always scrub local map (file mode primary path; redis outage fallback).
+    with _lock:
+        _ensure_loaded()
+        dead = [k for k, v in _map.items() if str(v.get("account_id") or "") == aid]
+        for k in dead:
+            _map.pop(k, None)
+            removed += 1
+        if dead:
+            _schedule_flush_locked()
+    return removed
+
+
 def rebind_on_failover(
     fingerprint: str | None,
     failed_account_id: str | None,
@@ -605,8 +760,29 @@ def status() -> dict[str, Any]:
         }
 
 
+def extract_claude_session_id(user_id: str | None) -> str | None:
+    """Extract Claude Code ``session_<uuid>`` from metadata.user_id (CPA parity)."""
+    if not user_id:
+        return None
+    s = str(user_id).strip()
+    if not s:
+        return None
+    m = _CLAUDE_SESSION_RE.search(s)
+    if m:
+        return m.group(0)[:200]
+    # Bare session_… string without surrounding junk.
+    if s.startswith("session_") and len(s) >= 16:
+        return s[:200]
+    return None
+
+
 def extract_conversation_id_from_headers(headers: Any) -> str | None:
-    """Read optional client conversation id from request headers."""
+    """Read optional client conversation / session id from request headers.
+
+    Header priority follows CLIProxyAPI SessionAffinitySelector where useful:
+      x-session-id / Session_id (Codex) / x-amp-thread-id / x-client-request-id
+    plus our existing grok2api / chat aliases.
+    """
     if headers is None:
         return None
     try:
@@ -618,6 +794,11 @@ def extract_conversation_id_from_headers(headers: Any) -> str | None:
         "x-conversation-id",
         "x-chat-id",
         "x-session-id",
+        "session_id",  # Codex-style
+        "x-amp-thread-id",
+        "x-client-request-id",
+        "x-thread-id",
+        "x-request-id",
     ):
         v = get(name)
         if v and str(v).strip():
@@ -626,10 +807,20 @@ def extract_conversation_id_from_headers(headers: Any) -> str | None:
 
 
 def extract_conversation_id_from_body(req: Any) -> str | None:
-    """Body conversation_id / metadata.conversation_id (OpenAI extras)."""
+    """Body conversation_id / metadata.session (OpenAI + Claude Code extras).
+
+    Also peels Claude Code ``session_<uuid>`` out of ``metadata.user_id`` so
+    Claude Code multi-turn sticks even when conversation_id is absent.
+    """
     if req is None:
         return None
-    for attr in ("conversation_id", "conversationId", "chat_id", "session_id"):
+    for attr in (
+        "conversation_id",
+        "conversationId",
+        "chat_id",
+        "session_id",
+        "thread_id",
+    ):
         v = getattr(req, attr, None)
         if v is None and isinstance(req, dict):
             v = req.get(attr)
@@ -645,14 +836,27 @@ def extract_conversation_id_from_body(req: Any) -> str | None:
             "chat_id",
             "session_id",
             "thread_id",
+            "user_id",  # may contain Claude session_…; also plain id
         ):
             v = meta.get(key)
-            if v and str(v).strip():
-                return str(v).strip()[:200]
+            if not v:
+                continue
+            s = str(v).strip()
+            if not s:
+                continue
+            if key == "user_id":
+                claude = extract_claude_session_id(s)
+                if claude:
+                    return claude
+                # Plain metadata.user_id as session only when it looks session-like.
+                if s.startswith("session_") or s.startswith("conv_") or s.startswith("thread_"):
+                    return s[:200]
+                continue
+            return s[:200]
     # pydantic extra fields
     extra = getattr(req, "model_extra", None)
     if isinstance(extra, dict):
-        for key in ("conversation_id", "conversationId", "chat_id"):
+        for key in ("conversation_id", "conversationId", "chat_id", "session_id"):
             v = extra.get(key)
             if v and str(v).strip():
                 return str(v).strip()[:200]
@@ -859,6 +1063,7 @@ def resolve_responses_affinity(
     api_key_id: str | None = None,
     prompt_cache_key: str | None = None,
     previous_response_id: str | None = None,
+    model: str | None = None,
 ) -> tuple[str | None, str | None, str]:
     """Resolve sticky (session_fp, prefer_account, source) for Responses turns.
 
@@ -866,23 +1071,27 @@ def resolve_responses_affinity(
       1. explicit conversation_id
       2. prompt_cache_key
       3. previous_response_id chain (account + linked session_fp)
-      4. user / message root fingerprint
+      4. user / messages-hash / message root fingerprint
 
     When a previous_response_id hits, the returned session_fp is the *linked*
     multi-turn identity (not the per-response chain key and not a fresh root
     hash). Callers must bind both session_fp and the newly emitted response_id
     with that same session_fp so the chain continues.
+
+    ``model`` scopes fingerprints (CPA-style) so cross-model reuse of a session
+    id does not force a stale account binding.
     """
     if not _enabled():
         return None, None, "disabled"
 
-    # 1–2 / 4: ordinary conversation fingerprint (cid / pck / root).
+    # 1–2 / 4: ordinary conversation fingerprint (cid / pck / msg-hash / root).
     base_fp = conversation_fingerprint(
         messages,
         user=user,
         conversation_id=conversation_id,
         api_key_id=api_key_id,
         prompt_cache_key=prompt_cache_key,
+        model=model,
     )
 
     # Prefer explicit cid / pck — they are already stable multi-turn keys.
@@ -909,8 +1118,14 @@ def resolve_responses_affinity(
             session = base_fp or response_chain_fingerprint(prev, api_key_id=api_key_id)
             return session, account, "previous_response_id_legacy"
 
-    # 4. root / user fingerprint (may be weak under Claude Code system churn).
+    # 4. msg-hash / root / user fingerprint.
     if base_fp:
         prefer = get_affinity(base_fp)
+        # Distinguish CPA-style messages hash from weak root for observability.
+        msg_fp = messages_content_fingerprint(
+            messages, api_key_id=api_key_id, model=model
+        )
+        if msg_fp and msg_fp == base_fp:
+            return base_fp, prefer, "messages_hash" if prefer else "messages_hash_new"
         return base_fp, prefer, "root" if prefer else "root_new"
     return None, None, "none"

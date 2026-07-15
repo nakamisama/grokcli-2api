@@ -135,6 +135,48 @@ def clear(fingerprint: str) -> None:
     delete(_k(fingerprint))
 
 
+def clear_for_account(account_id: str, *, scan_count: int = 200) -> int:
+    """Delete every affinity entry bound to ``account_id``.
+
+    No secondary index — SCAN ``g2a:affinity:*``. Intended for rare paths
+    (account disable / quota kill), not the hot request path.
+    Mirrors CLIProxyAPI SessionAffinitySelector.InvalidateAuth.
+    """
+    if not redis_enabled() or not account_id:
+        return 0
+    aid = str(account_id)
+    try:
+        from store.redis_client import get_client
+
+        c = get_client()
+        if c is None:
+            return 0
+        pattern = key("affinity", "*")
+        removed = 0
+        for k in c.scan_iter(match=pattern, count=scan_count):
+            raw = c.get(k)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = None
+            bound = None
+            if isinstance(data, dict):
+                bound = str(data.get("account_id") or "") or None
+            else:
+                bound = str(raw)
+            if bound == aid:
+                try:
+                    c.delete(k)
+                    removed += 1
+                except Exception:
+                    pass
+        return removed
+    except Exception:
+        return 0
+
+
 def status_sample(*, max_n: int = 8) -> dict[str, Any]:
     """Best-effort sample (SCAN). Costly on huge keyspaces — keep small."""
     if not redis_enabled():

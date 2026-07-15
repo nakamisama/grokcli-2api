@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.82"
+APP_VERSION = "1.9.86"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -197,6 +197,16 @@ def _is_local_infra_error(err: BaseException | str | None) -> bool:
         "runtimeerror: event loop",
     )
     return any(n in low for n in needles)
+
+
+def _note_account_pick(account_id: str | None) -> None:
+    """Soft-mark account as in-use so concurrent workers diversify picks."""
+    if not account_id:
+        return
+    try:
+        account_pool.note_account_pick(account_id)
+    except Exception:
+        pass
 
 
 def _report_upstream_failure(
@@ -3844,6 +3854,7 @@ def _resolve_conversation_affinity(
     *,
     api_key_id: str | None = None,
     body: dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> tuple[str | None, str | None, str | None, bool]:
     """
     Returns (fingerprint, preferred_account_id, prompt_cache_key, pck_minted).
@@ -3853,6 +3864,9 @@ def _resolve_conversation_affinity(
     Prefer prompt_cache_key when present so OpenAI/sub2api multi-turn stays on
     one account for prompt-cache locality. When the client omits it, mint one
     so subsequent turns (or response echoes) can stick.
+
+    ``model`` scopes the sticky fingerprint (CPA-style) so the same client
+    session on a different model does not inherit a stale account binding.
     """
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
@@ -3871,6 +3885,7 @@ def _resolve_conversation_affinity(
         conversation_id=conv_id,
         api_key_id=api_key_id,
         prompt_cache_key=pck,
+        model=model,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
     return fp, prefer, pck, minted
@@ -3932,12 +3947,16 @@ async def chat_completions(
 
     key_id = _api_key_id(api_key)
     timing = RequestTiming(protocol="openai", stream=bool(req.stream))
-    conv_fp, prefer_account, pck, pck_minted = await asyncio.to_thread(
-        _resolve_conversation_affinity, req, request, api_key_id=key_id
-    )
-    timing.mark_affinity(prefer_account)
     model = resolve_model(req.model)
     timing.model = model
+    conv_fp, prefer_account, pck, pck_minted = await asyncio.to_thread(
+        _resolve_conversation_affinity,
+        req,
+        request,
+        api_key_id=key_id,
+        model=model,
+    )
+    timing.mark_affinity(prefer_account)
 
     # Overlap account pick with body sanitize/compact so local TTFT is
     # max(pick, body) instead of pick + body on long tool histories.
@@ -4032,6 +4051,8 @@ async def chat_completions(
     first_tried: str | None = chain[0].auth_key if chain else None
 
     for attempt_i, creds in enumerate(chain):
+        if attempt_i > 0:
+            _note_account_pick(creds.auth_key)
         headers = upstream_headers(creds.token, model)
         try:
             timing.mark_upstream_start(account_id=creds.auth_key, attempt=attempt_i)
@@ -4310,6 +4331,8 @@ async def _stream_proxy_with_failover_inner(
     )
 
     for idx, creds in enumerate(chain):
+        if idx > 0:
+            _note_account_pick(creds.auth_key)
         headers = upstream_headers(creds.token, model)
         finished = False
         saw_tool_calls = False  # True only after a tool frame is outbound
@@ -5229,19 +5252,20 @@ def _resolve_anthropic_affinity(
     *,
     api_key_id: str | None = None,
     body: dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> tuple[str | None, str | None, str | None, bool]:
     """Fingerprint for sticky multi-turn on Anthropic-shaped requests.
 
     Returns (fingerprint, preferred_account_id, prompt_cache_key, pck_minted).
+
+    Conversation id extraction also peels Claude Code ``session_<uuid>`` from
+    ``metadata.user_id`` (CPA parity). ``model`` scopes the sticky fingerprint.
     """
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
     )
-    if not conv_id and isinstance(req.metadata, dict):
-        for k in ("conversation_id", "session_id", "thread_id"):
-            if req.metadata.get(k):
-                conv_id = str(req.metadata[k])
-                break
+    if not conv_id:
+        conv_id = conversation_affinity.extract_conversation_id_from_body(req)
     oa_msgs = anth.affinity_messages_from_request(req)
     # Prefer explicit metadata cache/session keys / headers; fall back to
     # cache_control fingerprint derived from system/tools so Claude Code sticks.
@@ -5272,6 +5296,7 @@ def _resolve_anthropic_affinity(
         conversation_id=conv_id,
         api_key_id=api_key_id,
         prompt_cache_key=pck,
+        model=model,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
     return fp, prefer, pck, minted
@@ -5326,12 +5351,16 @@ async def anthropic_messages(
         )
 
     timing = RequestTiming(protocol="anthropic", stream=bool(req.stream))
-    conv_fp, prefer_account, pck, pck_minted = await asyncio.to_thread(
-        _resolve_anthropic_affinity, req, request, api_key_id=key_id
-    )
-    timing.mark_affinity(prefer_account)
     model = resolve_model(req.model)
     timing.model = model
+    conv_fp, prefer_account, pck, pck_minted = await asyncio.to_thread(
+        _resolve_anthropic_affinity,
+        req,
+        request,
+        api_key_id=key_id,
+        model=model,
+    )
+    timing.mark_affinity(prefer_account)
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     timing.req_id = message_id.replace("msg_", "")[:12]
 
@@ -5430,7 +5459,9 @@ async def anthropic_messages(
     last_status = 502
     first_tried: str | None = chain[0].auth_key if chain else None
 
-    for creds in chain:
+    for _pick_i, creds in enumerate(chain):
+        if _pick_i > 0:
+            _note_account_pick(creds.auth_key)
         headers = upstream_headers(creds.token, model)
         try:
             content, reasoning, finish, usage, tool_calls = await _collect_completion(
@@ -5620,6 +5651,7 @@ def _responses_affinity(
     request: Request,
     *,
     api_key_id: str | None = None,
+    model: str | None = None,
 ) -> tuple[str | None, str | None, str, str | None, bool]:
     """Sticky identity for OpenAI Responses multi-turn.
 
@@ -5629,21 +5661,19 @@ def _responses_affinity(
       1. explicit conversation_id
       2. prompt_cache_key (stable across turns — primary cache sticky path)
       3. previous_response_id chain → linked session_fp + account
-      4. user / message root fingerprint
+      4. user / messages-hash / message root fingerprint
 
     When the client omits prompt_cache_key, mint one from conversation_id /
     previous_response_id so Claude Code / sub2api multi-turn still sticks and
     the key can be echoed for the next turn.
+
+    ``model`` scopes the sticky fingerprint (CPA provider::session::model).
     """
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
     )
-    if not conv_id and isinstance(req_body.get("metadata"), dict):
-        meta = req_body["metadata"]
-        for k in ("conversation_id", "session_id", "thread_id"):
-            if meta.get(k):
-                conv_id = str(meta[k])
-                break
+    if not conv_id:
+        conv_id = conversation_affinity.extract_conversation_id_from_body(req_body)
     # Top-level Responses conversation object (OpenAI shape).
     if not conv_id:
         conv_obj = req_body.get("conversation")
@@ -5697,6 +5727,7 @@ def _responses_affinity(
         api_key_id=api_key_id,
         prompt_cache_key=pck,
         previous_response_id=str(prev_id) if prev_id else None,
+        model=model,
     )
     # If we only had previous_response_id (no client pck) and mint used prev id,
     # re-key the sticky identity onto the minted pck fingerprint so future turns
@@ -5713,6 +5744,7 @@ def _responses_affinity(
                 conversation_id=None,
                 api_key_id=api_key_id,
                 prompt_cache_key=pck,
+                model=model,
             )
             if pck_fp:
                 conversation_affinity.bind_affinity(
@@ -5780,6 +5812,7 @@ async def openai_responses(
         req_body,
         request,
         api_key_id=key_id,
+        model=model,
     )
     timing.mark_affinity(prefer_account)
 
@@ -5840,7 +5873,9 @@ async def openai_responses(
         last_error: str | None = None
         last_status = 502
         first_tried: str | None = chain[0].auth_key if chain else None
-        for creds in chain:
+        for _pick_i, creds in enumerate(chain):
+            if _pick_i > 0:
+                _note_account_pick(creds.auth_key)
             headers = upstream_headers(creds.token, model)
             try:
                 content, reasoning, finish, usage, tool_calls = await _collect_completion(
@@ -5969,6 +6004,8 @@ async def openai_responses(
             first_tried: str | None = chain[0].auth_key if chain else None
             try:
                 for idx, creds in enumerate(chain):
+                    if idx > 0:
+                        _note_account_pick(creds.auth_key)
                     headers = upstream_headers(creds.token, model)
                     streamer = oai_resp.ResponsesLiveStreamer(
                         response_id=response_id,
@@ -6754,6 +6791,8 @@ async def _stream_anthropic_with_failover_inner(
         timing.mark_tools_requested(tools_requested)
     upstream_body = _body_for_upstream(body)
     for idx, creds in enumerate(chain):
+        if idx > 0:
+            _note_account_pick(creds.auth_key)
         headers = upstream_headers(creds.token, model)
         assembler = anth.AnthropicStreamAssembler(
             message_id=message_id,

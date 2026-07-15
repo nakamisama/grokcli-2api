@@ -36,8 +36,12 @@ from settings_store import (
 # {"code":"subscription:free-usage-exhausted","error":"You've used all the included
 # free usage for model grok-4.5-build-free for now. Usage resets over a rolling
 # 24-hour window — tokens (actual/limit): 2368681/2000000. ..."}
+# Also match broader "no quota / rate limit / 额度耗尽" phrasing so live traffic
+# always hard-kicks into the cooldown pool (never soft-only).
 _FREE_USAGE_CODE_RE = re.compile(
-    r"subscription:free-usage-exhausted|free-usage-exhausted",
+    r"(subscription:)?free[-_ ]?usage[-_ ]?exhausted|"
+    r"(subscription:)?usage[-_ ]?limit[-_ ]?exceeded|"
+    r"(subscription:)?rate[-_ ]?limit[-_ ]?exceeded",
     re.IGNORECASE,
 )
 _FREE_USAGE_TEXT_RE = re.compile(
@@ -45,7 +49,19 @@ _FREE_USAGE_TEXT_RE = re.compile(
     r"used\s+all\s+the\s+included\s+free\s+usage|"
     r"free\s+usage\s+for\s+model|"
     r"usage\s+resets\s+over\s+a\s+rolling|"
-    r"tokens\s*\(\s*actual\s*/\s*limit\s*\)"
+    r"tokens\s*\(\s*actual\s*/\s*limit\s*\)|"
+    r"free[-_ ]usage[-_ ]exhausted|"
+    r"free[-_ ]tier[-_ ]limit|"
+    r"quota[-_ ]exceeded|"
+    r"out\s+of\s+(free\s+)?(quota|credits?|tokens?)|"
+    r"no\s+(remaining\s+)?(quota|credits?|tokens?)|"
+    r"usage\s+limit\s+(exceeded|reached)|"
+    r"rate\s*limit|"
+    r"too\s+many\s+requests|"
+    r"额度(不足|耗尽|用完)|"
+    r"免费额度|"
+    r"用量(超限|耗尽)|"
+    r"配额(不足|耗尽|超限)"
     r")",
     re.IGNORECASE,
 )
@@ -83,18 +99,21 @@ PROBE_FAIL_KICK_STREAK = 2
 PROBE_FAIL_DISABLE_STREAK = 4
 PROBE_KICK_COOLDOWN_SEC = 600.0
 # free-usage (rolling 24h) recovery knobs.
-# Base wait after first free-usage hit; grows with stack but hard-capped so
-# cooldown holds until the next successful model probe (strict recovery).
-FREE_USAGE_COOLDOWN_BASE_SEC = 900.0   # 15m first hit
-FREE_USAGE_COOLDOWN_MAX_SEC = 3600.0   # 1h hard cap (rolling windows recover)
+# First free-usage hit hard-kicks the account into the cooldown pool for ALL
+# rotation strategies. Wall-clock until is a UI/Redis marker only — recovery is
+# probe-only (PROBE_ONLY_COOLDOWN_RECOVERY).
+FREE_USAGE_COOLDOWN_BASE_SEC = 900.0   # 15m first hit (UI remaining hint)
+FREE_USAGE_COOLDOWN_MAX_SEC = 3600.0   # 1h hard cap for UI remaining
 FREE_USAGE_STACK_MAX = 4              # stop stacking past this; just refresh until
-FREE_USAGE_RESTACK_MIN_SEC = 120.0    # ignore duplicate free-usage within this window
+FREE_USAGE_RESTACK_MIN_SEC = 30.0     # ignore duplicate free-usage spam within window
 # Strict recovery policy (operator rule):
 # live/request failure → enter cooldown and STAY cooling until the next
 # successful model probe (测活) or an explicit admin clear.
 # Wall-clock cooldown_until is only a UI/Redis marker; it must NOT auto-recover.
 PROBE_ONLY_COOLDOWN_RECOVERY = True
 # Far-future marker so "remaining" UIs and Redis TTL still show cooling.
+# Free-usage "没额度" uses this so the account is hard-kicked out of rotation
+# until probe/admin clear — not a soft 15m self-recover.
 PROBE_HOLD_COOLDOWN_SEC = 365.0 * 24.0 * 3600.0
 
 _lock = threading.RLock()
@@ -162,7 +181,7 @@ def parse_free_usage_error(error: str | None, status_code: int | None = None) ->
     return {
         "code": code or "subscription:free-usage-exhausted",
         "reason": (
-            f"临时额度耗尽，已冷却，等待下次测活成功"
+            f"临时额度耗尽，已冷却踢出轮询，等待下次测活成功"
             + (f" · {model}" if model else "")
             + (
                 f" · tokens {tokens_actual}/{tokens_limit}"
@@ -225,19 +244,39 @@ def apply_free_usage_cooldown(
     model: str | None = None,
     source: str = "probe",
 ) -> dict[str, Any] | None:
-    """Apply free-usage cooldown onto this account in PostgreSQL.
+    """Hard-kick account into the cooldown pool when free-usage / no-quota hits.
 
-    Design goals (large free-tier pools):
-    - Decision reference is the free-usage-exhausted payload.
-    - Under PROBE_ONLY_COOLDOWN_RECOVERY, cooldown holds until the next
-      successful model probe (or admin clear). Wall-clock alone never recovers.
-    - Duplicate free-usage hits inside FREE_USAGE_RESTACK_MIN_SEC only refresh
-      the remaining marker instead of stacking forever.
-    - Successful probe still clears stack → normal immediately.
+    Operator rule (all rotation strategies):
+    - First free-usage / 额度耗尽 hit → **immediately** leave live rotation
+      (``pool_status=cooldown``, durable ``cooldown_until`` far-future under
+      PROBE_ONLY_COOLDOWN_RECOVERY).
+    - Soft-block the exhausted model (extra safety if sticky re-binds).
+    - Clear conversation affinity so multi-turn no longer pins this account.
+    - Stay out until the next successful model probe (测活) or admin clear.
+      Wall-clock alone never recovers.
+
+    Duplicate free-usage hits inside FREE_USAGE_RESTACK_MIN_SEC only refresh
+    the marker (no stack thrash).
     """
     if not account_id:
         return None
     parsed = parse_free_usage_error(error, status_code)
+    if not parsed:
+        # Broader temporary-usage / rate-limit quota signals that parse missed.
+        try:
+            from model_health import is_temporary_usage_error
+
+            if is_temporary_usage_error(error or "", status_code):
+                parsed = {
+                    "code": "temporary_usage",
+                    "model": model,
+                    "reason": "临时额度/限流，已冷却踢出轮询",
+                    "detail": str(error or "")[:400],
+                    "tokens_actual": None,
+                    "tokens_limit": None,
+                }
+        except Exception:
+            parsed = None
     if not parsed:
         return None
     if model and not parsed.get("model"):
@@ -267,7 +306,9 @@ def apply_free_usage_cooldown(
             until_existing = float(meta.get("cooldown_until"))
     except (TypeError, ValueError):
         until_existing = None
-    still_active = bool(until_existing is not None and until_existing > now)
+    still_active = bool(until_existing is not None and until_existing > now) or (
+        str(meta.get("pool_status") or "").lower() == "cooldown"
+    )
     last_hit_at = 0.0
     if prev_stack:
         try:
@@ -283,7 +324,7 @@ def apply_free_usage_cooldown(
 
     restack = True
     if still_active and recent_hit:
-        # Same free-usage window already applied — only refresh remaining TTL.
+        # Same free-usage window already applied — only refresh remaining marker.
         restack = False
     if prev_count >= int(FREE_USAGE_STACK_MAX) and still_active:
         restack = False
@@ -309,20 +350,30 @@ def apply_free_usage_cooldown(
         stack = prev_stack or [entry]
         new_count = max(1, min(int(FREE_USAGE_STACK_MAX), prev_count or 1))
 
-    ttl = _free_usage_cooldown_ttl(new_count)
+    # Always hard-kick into cooldown pool (probe-hold). UI remaining uses a
+    # capped display TTL so the admin table does not show "365 days".
+    display_ttl = _free_usage_cooldown_ttl(new_count)
     if PROBE_ONLY_COOLDOWN_RECOVERY:
-        # Free-usage also holds until probe success (not wall-clock auto recover).
         ttl = float(PROBE_HOLD_COOLDOWN_SEC)
         until = now + ttl
         if still_active and until_existing is not None:
             until = max(until_existing, until)
-        reason = str(parsed.get("reason") or "临时额度耗尽，已冷却，等待下次测活成功")[:300]
+        reason = str(
+            parsed.get("reason")
+            or "临时额度耗尽，已冷却踢出轮询，等待下次测活成功"
+        )[:300]
     else:
-        # If already cooling, never shorten remaining wait; only extend up to cap.
+        ttl = display_ttl
         until = now + ttl
         if still_active and until_existing is not None:
-            until = max(until_existing, min(now + float(FREE_USAGE_COOLDOWN_MAX_SEC), until))
-        reason = str(parsed.get("reason") or "临时额度耗尽，已冷却，等待自动恢复/测活成功")[:300]
+            until = max(
+                until_existing,
+                min(now + float(FREE_USAGE_COOLDOWN_MAX_SEC), until),
+            )
+        reason = str(
+            parsed.get("reason")
+            or "临时额度耗尽，已冷却踢出轮询，等待自动恢复/测活成功"
+        )[:300]
     patch: dict[str, Any] = {
         "pool_status": "cooldown",
         "cooldown_count": new_count,
@@ -334,19 +385,25 @@ def apply_free_usage_cooldown(
         "cooldown_tokens_limit": parsed.get("tokens_limit"),
         "cooldown_detail": parsed.get("detail"),
         "cooldown_until": until,
-        # Keep wall-clock TTL (seconds remaining baseline) for UI / soft recovery.
-        "cooldown_sec": float(ttl),
+        # Display remaining baseline (capped); durable hold is cooldown_until.
+        "cooldown_sec": float(display_ttl if PROBE_ONLY_COOLDOWN_RECOVERY else ttl),
         "last_error": reason,
         "last_status_code": status_code,
+        # Stay "enabled" so admin can still probe/recover; live rotation excludes
+        # via is_in_cooldown (hard kick from all strategies).
         "enabled": True,
         "disabled_reason": None,
         "disabled_source": None,
+        "disabled_for_quota": False,
         "last_probe_status": "cooldown",
         "last_probe_fail_at": now,
+        "kicked_from_rotation": True,
+        "kick_reason": "free_usage",
+        "kick_at": now,
     }
     # Soft-block the exhausted model on this account for the same window.
     mid = parsed.get("model") or model
-    soft_ttl = min(float(ttl), float(SOFT_MODEL_BLOCK_TTL) * max(1, new_count))
+    soft_ttl = min(float(display_ttl), float(SOFT_MODEL_BLOCK_TTL) * max(1, new_count))
     soft_ttl = max(60.0, min(float(FREE_USAGE_COOLDOWN_MAX_SEC), soft_ttl))
     if mid:
         try:
@@ -359,6 +416,18 @@ def apply_free_usage_cooldown(
             )
         except Exception:
             pass
+    # Drop sticky bindings so multi-turn chats stop pinning this dead account.
+    try:
+        import conversation_affinity as _aff
+
+        _aff.clear_affinity_for_account(account_id)
+    except Exception:
+        pass
+    # Release any in-flight pick marks immediately.
+    try:
+        release_account_pick(account_id)
+    except Exception:
+        pass
     saved = patch_account_pool_meta(account_id, patch)
     try:
         from store.pool_redis import set_cooldown
@@ -367,10 +436,11 @@ def apply_free_usage_cooldown(
     except Exception:
         pass
     invalidate_pool_summary_cache()
-    action = "cooldown" if restack else "cooldown_refresh"
+    action = "cooldown_kick" if restack or not still_active else "cooldown_refresh"
     print(
         f"  [pool] free-usage {action} ×{new_count} "
-        f"ttl={int(ttl)}s account={account_id} model={mid} code={parsed.get('code')}"
+        f"account={account_id} model={mid} code={parsed.get('code')} "
+        f"(kicked from rotation until probe)"
     )
     return {
         "id": account_id,
@@ -382,8 +452,9 @@ def apply_free_usage_cooldown(
         "cooldown_model": mid,
         "cooldown_reason": reason,
         "cooldown_until": until,
-        "cooldown_ttl_sec": ttl,
+        "cooldown_ttl_sec": float(display_ttl if PROBE_ONLY_COOLDOWN_RECOVERY else ttl),
         "enabled": True,
+        "kicked_from_rotation": True,
         "meta": saved,
     }
 
@@ -1040,8 +1111,13 @@ def _pick_round_robin(eligible: list[GrokCredentials]) -> GrokCredentials:
         return eligible[idx]
 
 
-def _health_penalty(meta: dict[str, Any]) -> float:
-    """Higher = less healthy (used as sort key / inverse weight)."""
+def _health_penalty(meta: dict[str, Any], *, inflight: int = 0) -> float:
+    """Higher = less healthy (used as sort key / inverse weight).
+
+    ``inflight`` (optional) penalizes accounts already serving concurrent
+    requests so multi-worker picks spread out instead of stampeding the
+    same least_used / RR head.
+    """
     pen = float(meta.get("consecutive_fails") or 0) * 3.0
     fails = float(meta.get("fail_count") or 0)
     ok = float(meta.get("success_count") or 0)
@@ -1052,27 +1128,147 @@ def _health_penalty(meta: dict[str, Any]) -> float:
             pen += max(0.0, float(meta.get("cooldown_until") or 0) - _now()) / 30.0
         except Exception:
             pen += 2.0
+    if inflight > 0:
+        # Soft concurrency tax: each in-flight request adds load weight.
+        pen += min(12.0, float(inflight) * 2.5)
     return pen
 
 
+# Process-local fallback when Redis is off (single-worker / file mode).
+_local_inflight: dict[str, tuple[int, float]] = {}  # id -> (count, expire_ts)
+_local_soft_used: dict[str, float] = {}
+_local_spread_lock = threading.Lock()
+_LOCAL_INFLIGHT_TTL = 90.0
+_LOCAL_SOFT_USED_TTL = 45.0
+
+
+def _local_spread_purge(now: float | None = None) -> None:
+    t = float(now if now is not None else time.time())
+    dead = [k for k, (_n, exp) in _local_inflight.items() if exp <= t]
+    for k in dead:
+        _local_inflight.pop(k, None)
+    # soft_used entries older than TTL drop out via effective comparison only
+
+
+def _load_spread_hints(
+    account_ids: list[str],
+) -> tuple[dict[str, int], dict[str, float]]:
+    """Batch-read in-flight counts + soft last_used stamps.
+
+    Prefers Redis (multi-worker). Falls back to process-local maps so file-mode
+    / single-worker still spreads concurrent picks.
+    """
+    inflight: dict[str, int] = {}
+    soft_used: dict[str, float] = {}
+    if not account_ids:
+        return inflight, soft_used
+    try:
+        from store.pool_redis import get_inflight_many, get_soft_used_many
+
+        inflight = get_inflight_many(account_ids) or {}
+        soft_used = get_soft_used_many(account_ids) or {}
+    except Exception:
+        pass
+    # Merge process-local (covers Redis-off and same-process races before Redis TTL)
+    now = time.time()
+    with _local_spread_lock:
+        _local_spread_purge(now)
+        for aid in account_ids:
+            if not aid:
+                continue
+            loc = _local_inflight.get(aid)
+            if loc and loc[1] > now:
+                inflight[aid] = max(int(inflight.get(aid) or 0), int(loc[0]))
+            su = _local_soft_used.get(aid)
+            if su and (now - su) <= _LOCAL_SOFT_USED_TTL:
+                prev = float(soft_used.get(aid) or 0)
+                if su > prev:
+                    soft_used[aid] = su
+    return inflight, soft_used
+
+
+def _effective_last_used(meta: dict[str, Any], soft_ts: float | None) -> float:
+    """Prefer the newer of durable last_used_at and soft pick stamp."""
+    try:
+        durable = float(meta.get("last_used_at") or 0)
+    except Exception:
+        durable = 0.0
+    try:
+        soft = float(soft_ts or 0)
+    except Exception:
+        soft = 0.0
+    return max(durable, soft)
+
+
+def note_account_pick(account_id: str | None) -> None:
+    """Pick-time soft mark so concurrent workers spread load immediately."""
+    if not account_id:
+        return
+    now = time.time()
+    with _local_spread_lock:
+        n, exp = _local_inflight.get(account_id, (0, 0.0))
+        if exp <= now:
+            n = 0
+        _local_inflight[account_id] = (int(n) + 1, now + _LOCAL_INFLIGHT_TTL)
+        _local_soft_used[account_id] = now
+    try:
+        from store.pool_redis import note_pick
+
+        note_pick(account_id)
+    except Exception:
+        pass
+
+
+def release_account_pick(account_id: str | None) -> None:
+    """Release pick-time in-flight when request finishes (success or fail)."""
+    if not account_id:
+        return
+    now = time.time()
+    with _local_spread_lock:
+        n, exp = _local_inflight.get(account_id, (0, 0.0))
+        if exp <= now or n <= 1:
+            _local_inflight.pop(account_id, None)
+        else:
+            _local_inflight[account_id] = (int(n) - 1, now + _LOCAL_INFLIGHT_TTL)
+    try:
+        from store.pool_redis import release_inflight
+
+        release_inflight(account_id)
+    except Exception:
+        pass
+
+
 def _pick_random(eligible: list[GrokCredentials], state: dict[str, Any]) -> GrokCredentials:
+    ids = [c.auth_key or "" for c in eligible]
+    inflight, _soft = _load_spread_hints(ids)
     weights = []
     for c in eligible:
         meta = _pool_meta(c.auth_key or "", state)
-        # Down-weight unhealthy accounts instead of pure equal weight.
-        w = max(0.05, float(meta["weight"]) / (1.0 + _health_penalty(meta)))
+        aid = c.auth_key or ""
+        # Down-weight unhealthy + busy accounts instead of pure equal weight.
+        w = max(
+            0.05,
+            float(meta["weight"])
+            / (1.0 + _health_penalty(meta, inflight=int(inflight.get(aid) or 0))),
+        )
         weights.append(w)
     return random.choices(eligible, weights=weights, k=1)[0]
 
 
 def _pick_least_used(eligible: list[GrokCredentials], state: dict[str, Any]) -> GrokCredentials:
+    ids = [c.auth_key or "" for c in eligible]
+    inflight, soft_used = _load_spread_hints(ids)
+
     def score(c: GrokCredentials) -> tuple[float, int, float]:
         meta = _pool_meta(c.auth_key or "", state)
-        # Prefer healthy + least used + least recently used
+        aid = c.auth_key or ""
+        infl = int(inflight.get(aid) or 0)
+        last = _effective_last_used(meta, soft_used.get(aid))
+        # Prefer healthy + least used + least recently used (+ fewest in-flight)
         return (
-            _health_penalty(meta),
-            meta["request_count"],
-            float(meta["last_used_at"] or 0),
+            _health_penalty(meta, inflight=infl),
+            int(meta["request_count"]) + infl * 2,
+            last,
         )
 
     return min(eligible, key=score)
@@ -1149,31 +1345,24 @@ def acquire(
             redis_overlay=False,
         )
     ]
-    # Soft recovery ladder — never hard-fail light API calls while any enabled
-    # live account still exists. Agent frontends treat empty-pool as "stop".
+    # Soft recovery for model soft-blocks / expired-refreshable only.
+    # Cooling accounts (free-usage 用完 / 429 / empty_upstream 冷却池) are NEVER
+    # re-introduced into live rotation — they stay out until a successful probe
+    # or admin clear (PROBE_ONLY_COOLDOWN_RECOVERY).
     def _usable(c: GrokCredentials) -> bool:
         return (not c.expired) or (bool(auto_refresh) and bool(c.refresh_token))
 
     def _meta_local(c: GrokCredentials) -> dict[str, Any]:
         return _pool_meta(c.auth_key or "", state, redis_overlay=False)
 
+    def _not_cooling(c: GrokCredentials) -> bool:
+        return not is_in_cooldown(_meta_local(c))
+
     if not eligible:
-        # 1) ignore cooldown, still honor model soft/hard blocks
+        # 1) ignore temporary model soft-blocks (keep durable permanent blocks + cooldown)
         eligible = []
         for c in candidates:
-            if not _usable(c):
-                continue
-            meta = _meta_local(c)
-            if not meta.get("enabled", True):
-                continue
-            if model and is_model_blocked(c.auth_key or "", model, state, meta=meta):
-                continue
-            eligible.append(c)
-    if not eligible:
-        # 2) also ignore temporary model soft-blocks (keep durable permanent blocks)
-        eligible = []
-        for c in candidates:
-            if not _usable(c):
+            if not _usable(c) or not _not_cooling(c):
                 continue
             meta = _meta_local(c)
             if not meta.get("enabled", True):
@@ -1184,54 +1373,30 @@ def acquire(
                 continue
             eligible.append(c)
     if not eligible:
-        # 3) last resort: any enabled live account (even permanent model block)
-        # Prefer trying over returning AuthError — upstream may have recovered.
+        # 2) last resort among non-cooling enabled accounts (even permanent model block)
+        # Prefer trying over returning AuthError — model block may be stale.
         eligible = [
             c
             for c in candidates
-            if _usable(c) and _meta_local(c).get("enabled", True)
+            if _usable(c)
+            and _not_cooling(c)
+            and _meta_local(c).get("enabled", True)
         ]
     if not eligible and candidates:
-        # 4) absolute last resort: any live candidate (disabled only if quota-disabled still skipped)
+        # 3) absolute last resort: any non-cooling live candidate (skip quota-disabled)
         eligible = [
             c
             for c in candidates
-            if _usable(c) and not _meta_local(c).get("disabled_for_quota")
+            if _usable(c)
+            and _not_cooling(c)
+            and not _meta_local(c).get("disabled_for_quota")
         ]
-    if eligible and not any(
-        _eligible(c, state, model=model, redis_overlay=False) for c in candidates
-    ):
-        # We are in soft-recovery mode: prefer soonest-ready / healthiest.
-        try:
-            def _cd_key(c: GrokCredentials) -> tuple[int, float, float]:
-                meta = _meta_local(c)
-                blocked = 1 if (
-                    model and is_model_blocked(c.auth_key or "", model, state, meta=meta)
-                ) else 0
-                try:
-                    until = float(meta.get("cooldown_until") or 0)
-                except Exception:
-                    until = 0.0
-                return (blocked, until, _health_penalty(meta))
-            eligible = sorted(eligible, key=_cd_key)
-        except Exception:
-            pass
-        if mode in ("random", "least_used") and len(eligible) > 3:
-            window = eligible[: max(3, min(12, len(eligible) // 4 or 3))]
-            if mode == "random":
-                return _ensure_fresh_creds(
-                    _pick_random(window, state), auto_refresh=auto_refresh
-                )
-            return _ensure_fresh_creds(
-                _pick_least_used(window, state), auto_refresh=auto_refresh
-            )
-        if eligible:
-            return _ensure_fresh_creds(eligible[0], auto_refresh=auto_refresh)
     if not eligible:
-        msg = "No eligible accounts (all disabled, expired, excluded"
+        cooling_n = sum(1 for c in candidates if not _not_cooling(c))
+        msg = "No eligible accounts (all disabled, expired, excluded, or in cooldown pool"
         if model:
             msg += f", or blocked for model `{model}`"
-        msg += "). Enable accounts, clear model blocks, or re-login."
+        msg += f"). Cooling={cooling_n}. Wait for probe recovery, enable accounts, or re-login."
         raise AuthError(msg)
 
     if mode == "round_robin":
@@ -1241,8 +1406,32 @@ def acquire(
     elif mode == "least_used":
         picked = _pick_least_used(eligible, state)
     else:
-        picked = eligible[0]
-    return _ensure_fresh_creds(picked, auto_refresh=auto_refresh)
+        # RR head among eligible — diversify when several share the same
+        # health band by preferring fewer in-flight / older soft last_used.
+        ids = [c.auth_key or "" for c in eligible[: min(12, len(eligible))]]
+        inflight, soft_used = _load_spread_hints(ids)
+        head = eligible[: min(8, len(eligible))]
+        head = sorted(
+            head,
+            key=lambda c: (
+                int(
+                    _health_penalty(
+                        _pool_meta(c.auth_key or "", state),
+                        inflight=int(inflight.get(c.auth_key or "") or 0),
+                    )
+                    // 3
+                ),
+                int(inflight.get(c.auth_key or "") or 0),
+                _effective_last_used(
+                    _pool_meta(c.auth_key or "", state),
+                    soft_used.get(c.auth_key or ""),
+                ),
+            ),
+        )
+        picked = head[0] if head else eligible[0]
+    out = _ensure_fresh_creds(picked, auto_refresh=auto_refresh)
+    note_account_pick(out.auth_key or "")
+    return out
 
 
 def report_success(account_id: str | None, *, model: str | None = None) -> None:
@@ -1254,6 +1443,7 @@ def report_success(account_id: str | None, *, model: str | None = None) -> None:
     """
     if not account_id:
         return
+    release_account_pick(account_id)
     meta = _pool_meta(account_id, get_account_pool_state())
     still_cooling = is_in_cooldown(meta)
     # Live traffic never clears cooldown (clear_cooldown always False).
@@ -1310,6 +1500,8 @@ def report_failure(
     """
     if not account_id:
         return None
+
+    release_account_pick(account_id)
 
     # Read streak before writing so adaptive cooldown can scale.
     state = get_account_pool_state()
@@ -1389,19 +1581,21 @@ def report_failure(
         except Exception:
             pass
         print(
-            f"  [pool] live fail → cooldown account={account_id[:48]} "
+            f"  [pool] live fail → cooldown_kick account={account_id[:48]} "
             f"code={free.get('cooldown_code')} count={free.get('cooldown_count')} "
-            f"model={model or free.get('cooldown_model') or '-'}",
+            f"model={model or free.get('cooldown_model') or '-'} "
+            f"(removed from rotation until probe)",
             flush=True,
         )
         return {
-            "action": "cooldown",
+            "action": "cooldown_kick",
             "kind": "free_usage",
             "account_id": account_id,
             "cooldown_code": free.get("cooldown_code"),
             "cooldown_count": free.get("cooldown_count"),
             "cooldown_until": until_f,
-            "kicked": kicked,
+            "kicked": True,
+            "kicked_from_rotation": True,
             "soft_blocked": soft_blocked,
         }
 
@@ -1540,6 +1734,14 @@ def set_account_enabled(account_id: str, enabled: bool) -> dict[str, Any] | None
     else:
         patch["enabled"] = False
         patch["pool_status"] = "disabled"
+        # CPA-style InvalidateAuth: drop sticky bindings so later turns
+        # do not pin to a permanently disabled account.
+        try:
+            import conversation_affinity as _aff
+
+            _aff.clear_affinity_for_account(account_id)
+        except Exception:
+            pass
     # Immediate durable write (PG commit / file flush).
     patch_account_pool_meta(account_id, patch)
     for a in list_pool_accounts():
@@ -1688,6 +1890,12 @@ def disable_for_quota(
             f"  [quota] account disabled from pool: "
             f"{account_id} — {reason_s}"
         )
+        try:
+            import conversation_affinity as _aff
+
+            _aff.clear_affinity_for_account(account_id)
+        except Exception:
+            pass
     out = dict(saved) if isinstance(saved, dict) else {}
     out.update(
         {
@@ -2049,7 +2257,8 @@ def try_acquire_sequence(
 
     `prefer_account_id`: conversation affinity — put this account first so
     multi-turn chats stay on the same account (memory continuity), unless it is
-    cooling / model-blocked (then it stays in the chain but not forced first).
+    cooling / model-blocked. Cooling sticky accounts are hard-excluded from the
+    live chain (cooldown pool) and only return after probe / admin clear.
 
     Sticky multi-turn fast path: when prefer_account is ready/fresh, skip the
     full-pool scan and return a short chain (sticky first). Compatibility is
@@ -2262,17 +2471,23 @@ def try_acquire_sequence(
         if not _usable(c):
             continue
         meta = _meta(c)
+        # Cooling pool is hard-excluded from live rotation (free-usage 用完 /
+        # 429 / empty_upstream). Only successful probe or admin clear recovers.
+        if is_in_cooldown(meta):
+            continue
         if not meta.get("enabled", True):
             continue
         if model and is_model_blocked(c.auth_key or "", model, state, meta=meta):
             continue
         enabled.append(c)
     if not enabled:
-        # ignore temporary model soft-blocks (free-usage) so light calls still work
+        # ignore temporary model soft-blocks only (never re-include cooling)
         for c in pool_window:
             if not _usable(c):
                 continue
             meta = _meta(c)
+            if is_in_cooldown(meta):
+                continue
             if not meta.get("enabled", True):
                 continue
             if model and is_model_blocked(
@@ -2281,20 +2496,29 @@ def try_acquire_sequence(
                 continue
             enabled.append(c)
     if not enabled:
-        # any enabled live account in window
+        # any non-cooling enabled live account in window
         for c in pool_window:
-            if _usable(c) and _meta(c).get("enabled", True):
+            if not _usable(c):
+                continue
+            meta = _meta(c)
+            if is_in_cooldown(meta):
+                continue
+            if meta.get("enabled", True):
                 enabled.append(c)
     if not enabled:
-        # absolute last resort: window minus quota-disabled, else whole window
+        # absolute last resort: non-cooling, not quota-disabled
         for c in pool_window:
-            if _usable(c) and not _meta(c).get("disabled_for_quota"):
+            if not _usable(c):
+                continue
+            meta = _meta(c)
+            if is_in_cooldown(meta):
+                continue
+            if not meta.get("disabled_for_quota"):
                 enabled.append(c)
-        if not enabled:
-            enabled = [c for c in pool_window if _usable(c)]
     if not enabled and pool_order:
         # Window was unlucky (all cooling/disabled). One bounded expand only —
         # still avoid full-table state read by batching the next slice.
+        # Cooling accounts remain excluded from the expanded window.
         extra = [c for c in pool_order if c not in pool_window][: max(32, window_n)]
         if state_is_partial and extra:
             try:
@@ -2308,6 +2532,8 @@ def try_acquire_sequence(
             if not _usable(c):
                 continue
             meta = _meta(c)
+            if is_in_cooldown(meta):
+                continue
             if not meta.get("enabled", True):
                 continue
             if model and is_model_blocked(c.auth_key or "", model, state, meta=meta):
@@ -2327,52 +2553,55 @@ def try_acquire_sequence(
         deduped.append(c)
     enabled = deduped
 
-    def cool_key(c: GrokCredentials) -> tuple[int, float, int, float]:
+    # Concurrent load-spread hints (Redis). Empty maps when Redis is off —
+    # ordering then falls back to durable counters only.
+    spread_ids = [c.auth_key or "" for c in enabled if c.auth_key]
+    inflight_map, soft_used_map = _load_spread_hints(spread_ids)
+
+    def ready_key(c: GrokCredentials) -> tuple[float, int, float]:
         meta = _meta(c)
-        cooling = 1 if is_in_cooldown(meta) else 0
-        # sooner-ready cooling accounts rank ahead of long-cooling ones
-        until = 0.0
-        if cooling:
-            try:
-                until = float(meta.get("cooldown_until") or 0)
-            except Exception:
-                until = 0.0
-        used = int(meta.get("request_count") or 0)
-        last = float(meta.get("last_used_at") or 0)
-        health = _health_penalty(meta)
+        aid = c.auth_key or ""
+        infl = int(inflight_map.get(aid) or 0)
+        used = int(meta.get("request_count") or 0) + infl * 2
+        last = _effective_last_used(meta, soft_used_map.get(aid))
+        health = _health_penalty(meta, inflight=infl)
         if mode == "least_used":
-            return (cooling, health, used, last)
-        return (cooling, until if cooling else health, used if mode == "least_used" else 0, last)
+            return (health, used, last)
+        return (health, infl, last)
 
     if mode == "random":
         ordered = list(enabled)
         random.shuffle(ordered)
         ordered.sort(
-            key=lambda c: (
-                1 if is_in_cooldown(_meta(c)) else 0,
-                _health_penalty(_meta(c)),
+            key=lambda c: _health_penalty(
+                _meta(c),
+                inflight=int(inflight_map.get(c.auth_key or "") or 0),
             )
         )
     elif mode == "least_used":
-        ordered = sorted(enabled, key=cool_key)
-    else:  # round_robin — window already rotated; just prefer ready accounts
+        ordered = sorted(enabled, key=ready_key)
+    else:  # round_robin — window already rotated; prefer healthier + less busy
         if not enabled:
             return []
-        # O(1) position map — preserve RR order from the window construction.
         pos = {id(c): i for i, c in enumerate(enabled)}
-        not_cooling = [c for c in enabled if not is_in_cooldown(_meta(c))]
-        cooling = [c for c in enabled if is_in_cooldown(_meta(c))]
-        cooling.sort(key=lambda c: float(_meta(c).get("cooldown_until") or 0))
-        not_cooling_sorted = sorted(
-            not_cooling,
+        ordered = sorted(
+            enabled,
             key=lambda c: (
-                int(_health_penalty(_meta(c)) // 3),
+                int(
+                    _health_penalty(
+                        _meta(c),
+                        inflight=int(inflight_map.get(c.auth_key or "") or 0),
+                    )
+                    // 3
+                ),
+                int(inflight_map.get(c.auth_key or "") or 0),
                 pos.get(id(c), 0),
             ),
         )
-        ordered = not_cooling_sorted + cooling
 
     # Conversation affinity: pin multi-turn chat to same account first only when ready.
+    # Cooling sticky accounts are already excluded from ``enabled`` — do not
+    # re-inject them into the live chain (they stay in the cooldown pool).
     if prefer_account_id and ordered:
         sticky: list[GrokCredentials] = []
         rest: list[GrokCredentials] = []
@@ -2391,11 +2620,8 @@ def try_acquire_sequence(
                     sticky[0].auth_key or "", model, state, meta=sm
                 )
             )
-            # Prefer ready peers first when sticky is cooling / model-blocked /
-            # already failing. Keep sticky in chain for later try (affinity).
             if (
-                is_in_cooldown(sm)
-                or sticky_blocked
+                sticky_blocked
                 or int(sm.get("consecutive_fails") or 0) >= 2
                 or sticky[0].expired
             ):
@@ -2406,21 +2632,11 @@ def try_acquire_sequence(
     limit = max_attempts if max_attempts is not None else max_failover_attempts()
     # Soft-block waves: allow a modest longer chain, but keep it TTFT-friendly.
     if max_attempts is None:
-        ready = sum(
-            1
-            for c in ordered
-            if not is_in_cooldown(_meta(c))
-            and not (
-                model
-                and is_model_blocked(
-                    c.auth_key or "", model, state, meta=_meta(c)
-                )
-            )
-        )
+        ready = len(ordered)
         if ready < 2:
-            limit = max(int(limit or 1), min(8, max(4, len(ordered) // 8 or 4)))
+            limit = max(int(limit or 1), min(8, max(4, ready or 4)))
     if limit is not None:
-        ordered = ordered[: max(1, int(limit))]
+        ordered = ordered[: max(1, int(limit))] if ordered else []
     # Only refresh the first candidate if it is already expired. Refreshing the
     # whole chain here serializes OIDC RTs before any upstream byte is sent.
     if ordered:
@@ -2428,10 +2644,18 @@ def try_acquire_sequence(
         if first.expired and not first.refresh_token:
             # First account unusable and no refresh path — drop it and try next
             # without paying OIDC for the rest of the chain yet.
-            rest = list(ordered[1:])
-            return [c for c in rest if (not c.expired) or c.refresh_token]
+            rest = [c for c in ordered[1:] if (not c.expired) or c.refresh_token]
+            if rest:
+                note_account_pick(rest[0].auth_key or "")
+            return rest
         ordered = [first] + list(ordered[1:])
-    return [c for c in ordered if (not c.expired) or c.refresh_token]
+    out = [c for c in ordered if (not c.expired) or c.refresh_token]
+    if out:
+        # Soft-mark the head so concurrent requests diversify immediately.
+        # Failover tails are marked when the caller actually switches (via
+        # note_account_pick on report_failure + next attempt, or re-acquire).
+        note_account_pick(out[0].auth_key or "")
+    return out
 
 
 def clear_account_cooldown(account_id: str) -> dict[str, Any] | None:
@@ -2563,6 +2787,12 @@ def kick_from_pool(
             "pool_status": "disabled",
         },
     )
+    try:
+        import conversation_affinity as _aff
+
+        _aff.clear_affinity_for_account(account_id)
+    except Exception:
+        pass
     return {"id": account_id, "enabled": False, "disabled_reason": reason_s, "pool_status": "disabled"}
 
 

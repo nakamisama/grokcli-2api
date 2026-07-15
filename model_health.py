@@ -270,9 +270,17 @@ _TEMP_USAGE_RE = re.compile(
     r"used\s+all\s+the\s+included\s+free\s+usage|"
     r"free\s+usage\s+for\s+model|"
     r"usage\s+resets\s+over\s+a\s+rolling|"
+    r"usage\s+limit\s+(exceeded|reached)|"
+    r"quota[-_ ]exceeded|"
+    r"out\s+of\s+(free\s+)?(quota|credits?|tokens?)|"
+    r"no\s+(remaining\s+)?(quota|credits?|tokens?)|"
     r"rate[_ -]?limit|"
     r"too\s+many\s+requests|"
-    r"try\s+again\s+later"
+    r"try\s+again\s+later|"
+    r"额度(不足|耗尽|用完)|"
+    r"免费额度|"
+    r"用量(超限|耗尽)|"
+    r"配额(不足|耗尽|超限)"
     r")",
     re.IGNORECASE,
 )
