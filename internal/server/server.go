@@ -479,7 +479,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
-	candidates, err := listCandidates(r.Context(), options)
+	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
@@ -763,7 +763,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	allowedTools := allowedAnthropicToolNames(body)
 	chatReq := proxy.ChatRequest{Model: model, Stream: false, Raw: body}
-	candidates, err := listCandidates(r.Context(), options)
+	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, err.Error(), "api_error")
 		return
@@ -960,7 +960,15 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		writeOpenAIError(w, http.StatusBadRequest, "input must contain at least one message", "invalid_request_error")
 		return
 	}
-	candidates, err := listCandidates(r.Context(), options)
+	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body}
+	// Preserve client prompt_cache_key on chatReq for sticky fingerprint (stripped later for upstream).
+	if pck := strings.TrimSpace(stringValue(raw["prompt_cache_key"])); pck != "" {
+		if chatReq.Raw == nil {
+			chatReq.Raw = map[string]any{}
+		}
+		chatReq.Raw["prompt_cache_key"] = pck
+	}
+	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
@@ -968,7 +976,6 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	service := proxy.ChatService{Catalog: modelCatalog(options), Client: upstreamClient(options), PickObserver: options.PickObserver, AffinityStore: options.AffinityStore}
 	started := time.Now()
 	responseID := responses.NewResponseID()
-	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body}
 	respPolicy := historycompact.ResolveOutboundToolPolicy(
 		"openai_responses",
 		r.UserAgent(),
@@ -2433,6 +2440,25 @@ func upstreamClient(options Options) *grok.Client {
 	return &grok.Client{BaseURL: options.Config.UpstreamBase}
 }
 
+func listCandidatesForRequest(ctx context.Context, options Options, chatReq proxy.ChatRequest, headers http.Header) ([]pool.Candidate, error) {
+	candidates, err := listCandidates(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	fp := proxy.ChatFingerprint(chatReq)
+	if fp == "" {
+		fp = proxy.ChatFingerprintFromHeaders(headers, chatReq.Model)
+	}
+	// If still empty, try raw prompt_cache_key alone.
+	if fp == "" && chatReq.Raw != nil {
+		if pck, _ := chatReq.Raw["prompt_cache_key"].(string); strings.TrimSpace(pck) != "" {
+			fp = "chat:" + strings.TrimSpace(chatReq.Model) + ":prompt_cache_key:" + strings.TrimSpace(pck)
+		}
+	}
+	sticky := stickyAccountID(ctx, options, fp)
+	return ensureStickyCandidate(ctx, options, candidates, sticky), nil
+}
+
 func listCandidates(ctx context.Context, options Options) ([]pool.Candidate, error) {
 	if len(options.Candidates) > 0 {
 		out := make([]pool.Candidate, len(options.Candidates))
@@ -2443,6 +2469,42 @@ func listCandidates(ctx context.Context, options Options) ([]pool.Candidate, err
 		return nil, errors.New("PostgreSQL store unavailable")
 	}
 	return options.Store.ListPoolCandidates(ctx)
+}
+
+// ensureStickyCandidate injects an affinity-bound account into the pick window
+// even when it is outside the top-N least_used scan. Critical for prompt-cache
+// multi-turn (Codex prompt_cache_key / X-Grok-Conv-Id) high hit rates.
+func ensureStickyCandidate(ctx context.Context, options Options, candidates []pool.Candidate, stickyID string) []pool.Candidate {
+	stickyID = strings.TrimSpace(stickyID)
+	if stickyID == "" || options.Store == nil {
+		return candidates
+	}
+	for _, c := range candidates {
+		if c.ID == stickyID {
+			return candidates
+		}
+	}
+	extra, err := options.Store.GetPoolCandidate(ctx, stickyID)
+	if err != nil || extra == nil {
+		return candidates
+	}
+	// Put sticky first so prepareChain affinity boost is redundant but safe.
+	out := make([]pool.Candidate, 0, len(candidates)+1)
+	out = append(out, *extra)
+	out = append(out, candidates...)
+	return out
+}
+
+func stickyAccountID(ctx context.Context, options Options, fingerprint string) string {
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" || options.AffinityStore == nil {
+		return ""
+	}
+	id, err := options.AffinityStore.GetAffinity(ctx, fingerprint)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(id)
 }
 
 func modelCatalog(options Options) *models.Catalog {

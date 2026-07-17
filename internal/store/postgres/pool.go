@@ -21,6 +21,42 @@ var (
 
 const candidateCacheTTL = 400 * time.Millisecond
 
+// GetPoolCandidate loads one account as a pick candidate (sticky TTFT / prompt-cache path).
+func (c *Connector) GetPoolCandidate(ctx context.Context, accountID string) (*pool.Candidate, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, nil
+	}
+	row := c.Pool.QueryRow(ctx, `
+		SELECT a.id, a.payload, a.email, a.user_id, a.team_id, a.expires_at,
+		       COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false),
+		       ap.cooldown_until, COALESCE(ap.blocked_models, '{}'::jsonb),
+		       COALESCE(ap.request_count, 0), COALESCE(ap.weight, 1)
+		FROM accounts a
+		LEFT JOIN account_pool ap ON ap.account_id = a.id
+		WHERE a.id = $1
+		LIMIT 1`, accountID)
+	var candidate pool.Candidate
+	var payloadBytes, blockedBytes []byte
+	var email, userID, teamID *string
+	var expiresAt, cooldownUntil *time.Time
+	if err := row.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight); err != nil {
+		return nil, err
+	}
+	payload := decodeMap(payloadBytes)
+	candidate.Token, _ = firstString(payload, "key", "access_token", "token")
+	candidate.Email = stringValue(email, stringFromMap(payload, "email"))
+	candidate.UserID = stringValue(userID, firstMapString(payload, "user_id", "principal_id"))
+	candidate.TeamID = stringValue(teamID, stringFromMap(payload, "team_id"))
+	candidate.ExpiresAt = expiresAt
+	candidate.CooldownUntil = cooldownUntil
+	candidate.BlockedModels = decodeMap(blockedBytes)
+	if strings.TrimSpace(candidate.Token) == "" {
+		return nil, nil
+	}
+	return &candidate, nil
+}
+
 func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, error) {
 	candidateCacheMu.Lock()
 	if time.Since(candidateCacheAt) < candidateCacheTTL && len(candidateCacheData) > 0 {

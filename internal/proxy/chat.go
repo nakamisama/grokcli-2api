@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -663,9 +664,21 @@ func upstreamAccounts(chain []pool.Candidate) []grok.Account {
 }
 
 func ChatFingerprint(request ChatRequest) string {
-	for _, key := range []string{"conversation_id", "conversation", "thread_id", "session_id", "prompt_cache_key"} {
+	if request.Raw == nil {
+		return ""
+	}
+	// Explicit sticky keys first (Codex / OpenAI Responses multi-turn).
+	for _, key := range []string{"prompt_cache_key", "conversation_id", "conversation", "thread_id", "session_id"} {
 		if value, _ := request.Raw[key].(string); strings.TrimSpace(value) != "" {
 			return "chat:" + strings.TrimSpace(request.Model) + ":" + key + ":" + strings.TrimSpace(value)
+		}
+	}
+	// Nested metadata (Anthropic / some relays).
+	if meta, _ := request.Raw["metadata"].(map[string]any); meta != nil {
+		for _, key := range []string{"prompt_cache_key", "session_id", "sessionId", "thread_id", "conversation_id", "user_id"} {
+			if value, _ := meta[key].(string); strings.TrimSpace(value) != "" {
+				return "chat:" + strings.TrimSpace(request.Model) + ":meta:" + key + ":" + strings.TrimSpace(value)
+			}
 		}
 	}
 	messages, ok := request.Raw["messages"].([]any)
@@ -678,6 +691,35 @@ func ChatFingerprint(request ChatRequest) string {
 	}
 	sum := sha256.Sum256(encoded)
 	return "chat:" + strings.TrimSpace(request.Model) + ":messages:" + hex.EncodeToString(sum[:16])
+}
+
+// ChatFingerprintFromHeaders picks sticky keys from common client/proxy headers
+// (Codex X-Grok-Conv-Id, session/thread headers).
+func ChatFingerprintFromHeaders(headers http.Header, model string) string {
+	if headers == nil {
+		return ""
+	}
+	get := func(names ...string) string {
+		for _, name := range names {
+			if v := strings.TrimSpace(headers.Get(name)); v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	if v := get("X-Grok-Conv-Id", "x-grok-conv-id", "X-Grok2API-Conv-Id"); v != "" {
+		return "chat:" + strings.TrimSpace(model) + ":conv:" + v
+	}
+	if v := get("X-Session-Id", "x-session-id", "Session-Id"); v != "" {
+		return "chat:" + strings.TrimSpace(model) + ":session:" + v
+	}
+	if v := get("X-Thread-Id", "x-thread-id", "Thread-Id"); v != "" {
+		return "chat:" + strings.TrimSpace(model) + ":thread:" + v
+	}
+	if v := get("X-Prompt-Cache-Key", "x-prompt-cache-key"); v != "" {
+		return "chat:" + strings.TrimSpace(model) + ":prompt_cache_key:" + v
+	}
+	return ""
 }
 
 func preferAffinity(ctx context.Context, candidates []pool.Candidate, store AffinityStore, fingerprint string) {
