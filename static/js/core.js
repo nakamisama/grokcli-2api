@@ -4910,6 +4910,20 @@ async function runJsonExportJob({ mode = "all", ids = [], buttonId = "btn-export
     } else {
       started = await api("/accounts/export?async_job=1");
     }
+    // Sync fallback for older servers: if payload returned directly, download it.
+    if (started && started.auth && !started.job_id) {
+      const blob = new Blob([JSON.stringify(started, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = mode === "selected"
+        ? `grok2api-auth-export-selected-${selectedN}.json`
+        : "grok2api-auth-export.json";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      setJsonIoProgress({ percent: 100, label: "导出完成", detail: a.download, done: started.count || selectedN || 0, total: started.count || selectedN || 0, success: started.count || 0, fail: 0, status: "done" });
+      toast(`已导出 ${started.count || selectedN || ""} 个账号`);
+      return;
+    }
     const jobId = started && started.job_id;
     if (!jobId) throw new Error("未返回 job_id，无法跟踪导出进度");
     setJsonIoProgress({

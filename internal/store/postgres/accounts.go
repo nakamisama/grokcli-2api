@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hm2899/grokcli-2api/internal/accounts"
 )
 
 type AccountList struct {
@@ -298,16 +300,21 @@ func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
 		add("(lower(COALESCE(a.email,'')) LIKE ? OR lower(a.id) LIKE ? OR lower(COALESCE(a.user_id,'')) LIKE ?)", like, like, like)
 	}
 	if hasSSO != nil {
+		// Parity with Python accounts_pg list filter + accounts.GetSSOValue shapes.
 		ssoExpr := `(
-			NULLIF(trim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL OR
-			NULLIF(trim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL OR
-			NULLIF(trim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL OR
-			NULLIF(trim(COALESCE(a.payload->>'cookie','')), '') IS NOT NULL OR
-			NULLIF(trim(COALESCE(a.payload->>'cookies','')), '') IS NOT NULL OR
-			(a.payload ? 'sso') OR (a.payload ? 'sso_cookie')
+			NULLIF(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload#>>'{session_cookies,sso}','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload#>>'{session_cookies,sso-rw}','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload#>>'{cookies,sso}','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload#>>'{cookies,sso-rw}','')), '') IS NOT NULL OR
+			COALESCE(a.payload->>'cookie','') ILIKE '%sso=%' OR
+			COALESCE(a.payload->>'cookies','') ILIKE '%sso=%' OR
+			COALESCE(a.payload->>'set_cookie','') ILIKE '%sso=%' OR
+			COALESCE(a.payload->>'set-cookie','') ILIKE '%sso=%' OR
+			COALESCE(a.payload->>'set_cookies','') ILIKE '%sso=%'
 		)`
-		// payload ? key uses ? which conflicts with placeholder — escape by not using add()
-		// Build absolute fragment manually.
 		if *hasSSO {
 			clauses = append(clauses, ssoExpr)
 		} else {
@@ -465,13 +472,38 @@ func tokenHint(token string) string {
 	return ""
 }
 
-func hasSSO(payload map[string]any) bool {
-	for _, key := range []string{"sso", "sso_cookie", "sso_token", "cookie", "cookies", "set_cookie", "set-cookie", "set_cookies"} {
-		if strings.Contains(strings.ToLower(stringFromMap(payload, key)), "sso") || stringFromMap(payload, key) != "" && strings.HasPrefix(key, "sso") {
-			return true
+// normalizeExportPayload ensures email + canonical SSO fields are present so
+// exports / sub2api / SSO download never miss nested cookie shapes.
+func normalizeExportPayload(payload map[string]any, id string, email *string) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if stringFromMap(payload, "email") == "" && email != nil && strings.TrimSpace(*email) != "" {
+		payload["email"] = strings.TrimSpace(*email)
+	}
+	if stringFromMap(payload, "id") == "" && id != "" {
+		payload["id"] = id
+	}
+	if sso := strings.TrimSpace(accounts.GetSSOValue(payload)); sso != "" {
+		payload["sso"] = sso
+		if stringFromMap(payload, "sso_cookie") == "" {
+			payload["sso_cookie"] = sso
 		}
 	}
-	return false
+	// Mirror password aliases used by re-import / SSO text export.
+	if stringFromMap(payload, "password") == "" && stringFromMap(payload, "register_password") != "" {
+		payload["password"] = stringFromMap(payload, "register_password")
+	}
+	if stringFromMap(payload, "register_password") == "" && stringFromMap(payload, "password") != "" {
+		payload["register_password"] = stringFromMap(payload, "password")
+	}
+	return payload
+}
+
+func hasSSO(payload map[string]any) bool {
+	// Must match accounts.GetSSOValue / Python has_sso_value — nested cookies and
+	// cookie-header forms count, not only top-level sso_* string fields.
+	return strings.TrimSpace(accounts.GetSSOValue(payload)) != ""
 }
 
 // activeBlockedModels drops expired soft blocks (until < now) so the UI does
@@ -980,7 +1012,7 @@ func (c *Connector) ExportAuthMap(ctx context.Context, accountIDs []string, incl
 			wanted[id] = struct{}{}
 		}
 	}
-	rows, err := c.Pool.Query(ctx, `SELECT id, payload FROM accounts ORDER BY updated_at DESC`)
+	rows, err := c.Pool.Query(ctx, `SELECT id, email, payload FROM accounts ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -989,8 +1021,9 @@ func (c *Connector) ExportAuthMap(ctx context.Context, accountIDs []string, incl
 	missing := []string{}
 	for rows.Next() {
 		var id string
+		var email *string
 		var payloadBytes []byte
-		if err := rows.Scan(&id, &payloadBytes); err != nil {
+		if err := rows.Scan(&id, &email, &payloadBytes); err != nil {
 			return nil, err
 		}
 		if len(wanted) > 0 {
@@ -998,10 +1031,19 @@ func (c *Connector) ExportAuthMap(ctx context.Context, accountIDs []string, incl
 				continue
 			}
 		}
-		payload := decodeMap(payloadBytes)
+		raw := decodeMap(payloadBytes)
+		payload := normalizeExportPayload(raw, id, email)
 		if !includeSecrets {
-			for _, key := range []string{"key", "access_token", "token", "refresh_token", "sso", "sso_cookie", "sso_token", "password", "register_password", "id_token"} {
+			hasSSO := strings.TrimSpace(accounts.GetSSOValue(payload)) != ""
+			hasRT := strings.TrimSpace(stringFromMap(payload, "refresh_token")) != ""
+			tok := firstMapString(payload, "key", "access_token", "token")
+			for _, key := range []string{"key", "access_token", "token", "refresh_token", "sso", "sso_cookie", "sso_token", "password", "register_password", "id_token", "session_cookies", "cookies", "cookie", "set_cookie", "set-cookie", "set_cookies"} {
 				delete(payload, key)
+			}
+			payload["has_sso"] = hasSSO
+			payload["has_refresh_token"] = hasRT
+			if tok != "" {
+				payload["token_hint"] = tokenHint(tok)
 			}
 		}
 		auth[id] = payload

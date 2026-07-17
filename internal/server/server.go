@@ -310,6 +310,12 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /admin/api/accounts/export-batch", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminExportAccountsBatch(w, r, options)
 	})
+	mux.HandleFunc("GET /admin/api/accounts/export/jobs/{job_id}", func(w http.ResponseWriter, r *http.Request) {
+		serveExportJobStatus(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/export/jobs/{job_id}/download", func(w http.ResponseWriter, r *http.Request) {
+		serveExportJobDownload(w, r, options)
+	})
 	mux.HandleFunc("POST /admin/api/accounts/delete-batch", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminDeleteAccountsBatch(w, r, options)
 	})
@@ -402,6 +408,12 @@ func NewMux(options Options) http.Handler {
 	})
 	mux.HandleFunc("POST /admin/api/accounts/export-sub2api-format", func(w http.ResponseWriter, r *http.Request) {
 		serveExportSub2APIFormat(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/push-sub2api", func(w http.ResponseWriter, r *http.Request) {
+		servePushSub2API(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/settings/sub2api/test", func(w http.ResponseWriter, r *http.Request) {
+		serveSub2APITest(w, r, options)
 	})
 	return mux
 }
@@ -2478,9 +2490,14 @@ func serveAdminExportAccounts(w http.ResponseWriter, r *http.Request, options Op
 		return
 	}
 	includeSecrets := r.URL.Query().Get("include_secrets") != "0" && r.URL.Query().Get("include_secrets") != "false"
+	asyncJob := truthy(r.URL.Query().Get("async_job"))
 	result, err := options.Store.ExportAuthMap(r.Context(), nil, includeSecrets)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if asyncJob {
+		writeJSON(w, http.StatusOK, startExportJob(result, "grok2api-auth-export.json"))
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -2501,9 +2518,15 @@ func serveAdminExportAccountsBatch(w http.ResponseWriter, r *http.Request, optio
 		includeSecrets = v
 	}
 	ids := stringSlice(body["ids"])
+	asyncJob := truthy(r.URL.Query().Get("async_job")) || truthy(fmt.Sprint(body["async_job"]))
 	result, err := options.Store.ExportAuthMap(r.Context(), ids, includeSecrets)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if asyncJob {
+		name := fmt.Sprintf("grok2api-auth-export-selected-%d.json", len(ids))
+		writeJSON(w, http.StatusOK, startExportJob(result, name))
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -3293,6 +3316,9 @@ func serveExportCLIProxyFormat(w http.ResponseWriter, r *http.Request, options O
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	ids := stringSlice(body["ids"])
+	if len(ids) == 0 {
+		ids = stringSlice(body["account_ids"])
+	}
 	if body["all"] == true {
 		ids = nil
 	}
@@ -3337,6 +3363,9 @@ func serveExportSub2APIFormat(w http.ResponseWriter, r *http.Request, options Op
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	ids := stringSlice(body["ids"])
+	if len(ids) == 0 {
+		ids = stringSlice(body["account_ids"])
+	}
 	if body["all"] == true {
 		ids = nil
 	}
@@ -3364,35 +3393,200 @@ func minInt(a, b int) int {
 	return b
 }
 
+var (
+	exportJobsMu sync.Mutex
+	exportJobs   = map[string]map[string]any{}
+)
+
+func startExportJob(result map[string]any, filename string) map[string]any {
+	jobID := fmt.Sprintf("exp_%d", time.Now().UnixNano())
+	auth, _ := result["auth"].(map[string]any)
+	count := 0
+	if auth != nil {
+		count = len(auth)
+	} else if v, ok := result["count"].(int); ok {
+		count = v
+	}
+	payload, _ := json.MarshalIndent(result, "", "  ")
+	job := map[string]any{
+		"ok": true, "job_id": jobID, "status": "done", "phase": "done",
+		"message": fmt.Sprintf("导出完成：%d 个账号", count),
+		"percent": 100, "done": count, "total": count, "count": count,
+		"success": count, "fail": 0, "download_ready": true,
+		"filename": filename, "payload": payload, "created_at": time.Now().Unix(),
+	}
+	exportJobsMu.Lock()
+	if len(exportJobs) > 20 {
+		exportJobs = map[string]map[string]any{}
+	}
+	exportJobs[jobID] = job
+	exportJobsMu.Unlock()
+	return map[string]any{
+		"ok": true, "job_id": jobID, "status": "done", "message": job["message"],
+		"total": count, "count": count, "filename": filename, "download_ready": true,
+	}
+}
+
+func serveExportJobStatus(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	id := r.PathValue("job_id")
+	exportJobsMu.Lock()
+	job := exportJobs[id]
+	exportJobsMu.Unlock()
+	if job == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "job not found"})
+		return
+	}
+	out := map[string]any{}
+	for k, v := range job {
+		if k == "payload" {
+			continue
+		}
+		out[k] = v
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func serveExportJobDownload(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	id := r.PathValue("job_id")
+	exportJobsMu.Lock()
+	job := exportJobs[id]
+	exportJobsMu.Unlock()
+	if job == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "job not found"})
+		return
+	}
+	payload, _ := job["payload"].([]byte)
+	if len(payload) == 0 {
+		writeJSON(w, http.StatusConflict, map[string]any{"detail": "export not ready"})
+		return
+	}
+	filename, _ := job["filename"].(string)
+	if filename == "" {
+		filename = "grok2api-auth-export.json"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
+}
+
+func servePushSub2API(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	ids := stringSlice(body["account_ids"])
+	if len(ids) == 0 {
+		ids = stringSlice(body["ids"])
+	}
+	if body["all"] == true {
+		ids = nil
+	}
+	var groupID *int
+	if v, ok := body["group_id"]; ok && v != nil {
+		switch t := v.(type) {
+		case float64:
+			n := int(t)
+			groupID = &n
+		case json.Number:
+			if i, err := t.Int64(); err == nil {
+				n := int(i)
+				groupID = &n
+			}
+		case string:
+			if i, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+				groupID = &i
+			}
+		}
+	}
+	out, err := integrations.PushSub2API(r.Context(), options.Store, ids, groupID, 4)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error(), "ok": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func serveSub2APITest(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	raw, err := options.Store.GetSetting(r.Context(), "sub2api_config")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "config missing"})
+		return
+	}
+	rm, _ := raw.(map[string]any)
+	test := integrations.TestSub2API(r.Context(), rm)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": test["ok"] == true, "test": test})
+}
+
 func buildSSOExport(authMap map[string]any) map[string]any {
 	auth, _ := authMap["auth"].(map[string]any)
 	lines := []string{}
 	items := []map[string]any{}
+	includePassword := false
 	for id, raw := range auth {
 		entry, _ := raw.(map[string]any)
+		if entry == nil {
+			continue
+		}
 		sso := accounts.GetSSOValue(entry)
 		if sso == "" {
 			continue
 		}
 		email := ""
-		if entry != nil {
-			if v, ok := entry["email"].(string); ok {
-				email = v
+		if v, ok := entry["email"].(string); ok {
+			email = strings.TrimSpace(v)
+		}
+		password := ""
+		if v, ok := entry["password"].(string); ok {
+			password = strings.TrimSpace(v)
+		}
+		if password == "" {
+			if v, ok := entry["register_password"].(string); ok {
+				password = strings.TrimSpace(v)
 			}
 		}
 		line := sso
-		if email != "" {
+		if email != "" && password != "" {
+			line = email + "----" + sso + "----" + password
+			includePassword = true
+		} else if email != "" {
 			line = email + "----" + sso
 		}
 		lines = append(lines, line)
 		items = append(items, map[string]any{"id": id, "email": email, "sso": sso})
 	}
+	content := strings.Join(lines, "\n")
 	return map[string]any{
-		"ok":    true,
-		"count": len(items),
-		"lines": lines,
-		"items": items,
-		"text":  strings.Join(lines, "\n"),
+		"ok":               true,
+		"count":            len(items),
+		"with_sso":         len(items),
+		"lines":            lines,
+		"items":            items,
+		"text":             content,
+		"content":          content,
+		"format":           "txt",
+		"ext":              "txt",
+		"media_type":       "text/plain;charset=utf-8",
+		"filename":         "grok2api-accounts-sso.txt",
+		"include_password": includePassword,
 	}
 }
 
